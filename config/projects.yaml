@@ -1,8 +1,8 @@
 projects:
   quant-platform:
-    name: Quant Platform
-    repository: D:/Code/quant-platform
-    worktree_root: D:/GPTWorktrees/quant-platform
+    name: Gpt-Local
+    repository: C:/OD-UIUC/文档/test-gpt-local
+    worktree_root: D:/GPTWorktrees/gpt-local
 
     pwsh:
       executable: C:/Program Files/PowerShell/7/pwsh.exe
