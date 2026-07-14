@@ -1,0 +1,32 @@
+# Secrets
+.env
+.env.local
+CONTROL_PLANE_API_KEY
+
+# Data & logs
+data/
+logs/
+operator.db
+
+# Worktrees (managed externally)
+D:/GPTWorktrees/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store

@@ -1,0 +1,34 @@
+projects:
+  quant-platform:
+    name: Quant Platform
+    repository: D:/Code/quant-platform
+    worktree_root: D:/GPTWorktrees/quant-platform
+
+    pwsh:
+      executable: C:/Program Files/PowerShell/7/pwsh.exe
+      default_timeout_seconds: 600
+      max_timeout_seconds: 3600
+      max_output_chars: 200000
+      inherit_user_environment: true
+
+    checks:
+      unit_tests:
+        script: |
+          python -m pytest -q
+        timeout_seconds: 1800
+
+      lint:
+        script: |
+          python -m ruff check .
+        timeout_seconds: 600
+
+      typecheck:
+        script: |
+          python -m mypy src
+        timeout_seconds: 900
+
+      git_tests:
+        script: |
+          git status --short
+          git diff --check
+        timeout_seconds: 120

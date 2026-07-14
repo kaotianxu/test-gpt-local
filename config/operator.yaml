@@ -1,0 +1,35 @@
+server:
+  host: 127.0.0.1
+  port: 8765
+  mcp_path: /mcp
+
+proxy:
+  enabled: true
+  url: http://127.0.0.1:7897
+  wait_for_proxy_seconds: 120
+  no_proxy:
+    - 127.0.0.1
+    - localhost
+    - ::1
+
+workspace:
+  ttl_hours: 168
+  max_active_per_project: 8
+
+process:
+  max_running_jobs: 3
+  default_timeout_seconds: 600
+  max_timeout_seconds: 3600
+  max_output_chars: 200000
+  output_tail_chars: 50000
+
+files:
+  max_read_chars: 100000
+  deny_paths:
+    - .git
+    - .env
+    - .env.local
+
+logging:
+  level: INFO
+  retention_days: 14
