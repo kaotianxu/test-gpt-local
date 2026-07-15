@@ -3,9 +3,8 @@
 Loads projects.yaml and operator.yaml from the config/ directory.
 """
 
-import os
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
@@ -73,7 +72,7 @@ def load_projects_config(path: Path | None = None) -> dict[str, Any]:
     """Load projects.yaml and return the project registry."""
     path = path or CONFIG_DIR / "projects.yaml"
     cfg = _load_yaml(path)
-    return cfg.get("projects", {})
+    return cast(dict[str, Any], cfg.get("projects", {}))
 
 
 def get_project(project_id: str) -> dict[str, Any] | None:
@@ -86,34 +85,34 @@ def get_server_bind() -> tuple[str, int]:
     """Return (host, port) for the MCP server."""
     cfg = load_operator_config()
     srv = cfg["server"]
-    return srv["host"], srv["port"]
+    return str(srv["host"]), int(srv["port"])
 
 
 def get_mcp_path() -> str:
     """Return the MCP HTTP path (e.g. '/mcp')."""
     cfg = load_operator_config()
-    return cfg["server"]["mcp_path"]
+    return str(cfg["server"]["mcp_path"])
 
 
 def get_proxy_config() -> dict[str, Any]:
     """Return the proxy configuration block."""
     cfg = load_operator_config()
-    return cfg["proxy"]
+    return cast(dict[str, Any], cfg["proxy"])
 
 
 def get_logging_config() -> dict[str, Any]:
     """Return the logging configuration block."""
     cfg = load_operator_config()
-    return cfg["logging"]
+    return cast(dict[str, Any], cfg["logging"])
 
 
 def get_process_config() -> dict[str, Any]:
     """Return the process configuration block."""
     cfg = load_operator_config()
-    return cfg["process"]
+    return cast(dict[str, Any], cfg["process"])
 
 
 def get_files_config() -> dict[str, Any]:
     """Return the file access configuration block."""
     cfg = load_operator_config()
-    return cfg["files"]
+    return cast(dict[str, Any], cfg["files"])

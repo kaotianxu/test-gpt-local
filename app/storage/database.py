@@ -4,11 +4,12 @@ Provides database initialisation and CRUD helpers for workspaces, processes,
 and operations as defined in the plan (section 14).
 """
 
+import hashlib
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from app.config import BASE_DIR
 
@@ -25,7 +26,7 @@ def _get_connection() -> sqlite3.Connection:
         _local.conn.row_factory = sqlite3.Row
         _local.conn.execute("PRAGMA journal_mode=WAL")
         _local.conn.execute("PRAGMA foreign_keys=ON")
-    return _local.conn
+    return cast(sqlite3.Connection, _local.conn)
 
 
 def init_db(db_path: str | Path | None = None) -> None:
@@ -83,10 +84,33 @@ def init_db(db_path: str | Path | None = None) -> None:
         CREATE INDEX IF NOT EXISTS idx_operation_workspace
             ON operations(workspace_id);
     """)
+    workspace_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(workspaces)").fetchall()
+    }
+    if "main_head_at_creation" not in workspace_columns:
+        conn.execute("ALTER TABLE workspaces ADD COLUMN main_head_at_creation TEXT")
+    if "main_status_at_creation" not in workspace_columns:
+        conn.execute("ALTER TABLE workspaces ADD COLUMN main_status_at_creation TEXT")
+    if "main_status_sha256_at_creation" not in workspace_columns:
+        conn.execute("ALTER TABLE workspaces ADD COLUMN main_status_sha256_at_creation TEXT")
+    legacy_statuses = conn.execute(
+        """SELECT workspace_id, main_status_at_creation FROM workspaces
+           WHERE main_status_at_creation IS NOT NULL
+             AND main_status_sha256_at_creation IS NULL"""
+    ).fetchall()
+    for row in legacy_statuses:
+        digest = hashlib.sha256(row["main_status_at_creation"].encode("utf-8")).hexdigest()
+        conn.execute(
+            """UPDATE workspaces
+               SET main_status_sha256_at_creation = ?, main_status_at_creation = NULL
+               WHERE workspace_id = ?""",
+            (digest, row["workspace_id"]),
+        )
     conn.commit()
 
 
 # ---- Workspace helpers ----
+
 
 def insert_workspace(
     workspace_id: str,
@@ -94,6 +118,8 @@ def insert_workspace(
     task_name: str,
     worktree_path: str,
     base_commit: str,
+    main_head_at_creation: str | None = None,
+    main_status_sha256_at_creation: str | None = None,
 ) -> dict[str, Any]:
     """Insert a new workspace record."""
     now = _now_iso()
@@ -101,13 +127,26 @@ def insert_workspace(
     conn.execute(
         """INSERT INTO workspaces
            (workspace_id, project_id, task_name, worktree_path, base_commit,
-            status, created_at, last_accessed_at)
-           VALUES (?, ?, ?, ?, ?, 'active', ?, ?)""",
-        (workspace_id, project_id, task_name, worktree_path,
-         base_commit, now, now),
+            status, created_at, last_accessed_at, main_head_at_creation,
+            main_status_sha256_at_creation)
+           VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)""",
+        (
+            workspace_id,
+            project_id,
+            task_name,
+            worktree_path,
+            base_commit,
+            now,
+            now,
+            main_head_at_creation,
+            main_status_sha256_at_creation,
+        ),
     )
     conn.commit()
-    return get_workspace(workspace_id)
+    record = get_workspace(workspace_id)
+    if record is None:
+        raise RuntimeError(f"failed to insert workspace: {workspace_id}")
+    return record
 
 
 def get_workspace(workspace_id: str) -> dict[str, Any] | None:
@@ -118,7 +157,9 @@ def get_workspace(workspace_id: str) -> dict[str, Any] | None:
     ).fetchone()
     if row is None:
         return None
-    return dict(row)
+    result = dict(row)
+    result.pop("main_status_at_creation", None)
+    return result
 
 
 def list_workspaces(project_id: str | None = None) -> list[dict[str, Any]]:
@@ -130,10 +171,11 @@ def list_workspaces(project_id: str | None = None) -> list[dict[str, Any]]:
             (project_id,),
         ).fetchall()
     else:
-        rows = conn.execute(
-            "SELECT * FROM workspaces ORDER BY created_at DESC"
-        ).fetchall()
-    return [dict(r) for r in rows]
+        rows = conn.execute("SELECT * FROM workspaces ORDER BY created_at DESC").fetchall()
+    results = [dict(r) for r in rows]
+    for result in results:
+        result.pop("main_status_at_creation", None)
+    return results
 
 
 def update_workspace_status(workspace_id: str, status: str) -> None:
@@ -164,13 +206,20 @@ def touch_workspace(workspace_id: str) -> None:
 
 
 def delete_workspace(workspace_id: str) -> None:
-    """Remove a workspace record (used when discarding)."""
+    """Remove a workspace record and its associated processes/operations (used when discarding)."""
     conn = _get_connection()
-    conn.execute("DELETE FROM workspaces WHERE workspace_id = ?", (workspace_id,))
-    conn.commit()
+    try:
+        conn.execute("DELETE FROM processes WHERE workspace_id = ?", (workspace_id,))
+        conn.execute("DELETE FROM operations WHERE workspace_id = ?", (workspace_id,))
+        conn.execute("DELETE FROM workspaces WHERE workspace_id = ?", (workspace_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 # ---- Process helpers ----
+
 
 def insert_process(
     process_id: str,
@@ -189,22 +238,42 @@ def insert_process(
            (process_id, workspace_id, tool_name, script_sha256,
             script_preview, working_directory, status, stdout_path, stderr_path)
            VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
-        (process_id, workspace_id, tool_name, script_sha256,
-         script_preview, working_directory, stdout_path, stderr_path),
+        (
+            process_id,
+            workspace_id,
+            tool_name,
+            script_sha256,
+            script_preview,
+            working_directory,
+            stdout_path,
+            stderr_path,
+        ),
     )
     conn.commit()
-    return get_process(process_id)
+    record = get_process(process_id)
+    if record is None:
+        raise RuntimeError(f"failed to insert process: {process_id}")
+    return record
 
 
 def get_process(process_id: str) -> dict[str, Any] | None:
     """Return a process dict or None."""
     conn = _get_connection()
-    row = conn.execute(
-        "SELECT * FROM processes WHERE process_id = ?", (process_id,)
-    ).fetchone()
+    row = conn.execute("SELECT * FROM processes WHERE process_id = ?", (process_id,)).fetchone()
     if row is None:
         return None
     return dict(row)
+
+
+def list_processes(workspace_id: str) -> list[dict[str, Any]]:
+    """List all recorded processes for a workspace, newest first."""
+    conn = _get_connection()
+    rows = conn.execute(
+        """SELECT * FROM processes WHERE workspace_id = ?
+           ORDER BY COALESCE(started_at, '') DESC, process_id DESC""",
+        (workspace_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def update_process_status(
@@ -216,14 +285,14 @@ def update_process_status(
 ) -> None:
     """Update process status and optional fields."""
     conn = _get_connection()
-    fields = {"status": status}
+    fields: dict[str, object] = {"status": status}
     if pid is not None:
         fields["pid"] = pid
     if exit_code is not None:
         fields["exit_code"] = exit_code
     if completed_at is not None:
         fields["completed_at"] = completed_at
-    if status == "running" and pid is not None:
+    if status == "running":
         fields["started_at"] = _now_iso()
 
     set_clause = ", ".join(f"{k} = ?" for k in fields)
@@ -233,6 +302,7 @@ def update_process_status(
 
 
 # ---- Operation helpers ----
+
 
 def log_operation(
     operation_id: str,
@@ -247,8 +317,7 @@ def log_operation(
         """INSERT INTO operations
            (operation_id, workspace_id, tool_name, summary, success, started_at)
            VALUES (?, ?, ?, ?, ?, ?)""",
-        (operation_id, workspace_id, tool_name, summary,
-         int(success), _now_iso()),
+        (operation_id, workspace_id, tool_name, summary, int(success), _now_iso()),
     )
     conn.commit()
 
@@ -263,7 +332,19 @@ def complete_operation(operation_id: str) -> None:
     conn.commit()
 
 
+def list_operations(workspace_id: str) -> list[dict[str, Any]]:
+    """List audit operations for a workspace, oldest first."""
+    conn = _get_connection()
+    rows = conn.execute(
+        """SELECT * FROM operations WHERE workspace_id = ?
+           ORDER BY started_at ASC, operation_id ASC""",
+        (workspace_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 # ---- Internal ----
+
 
 def _now_iso() -> str:
     """Return current UTC time as ISO 8601 string."""

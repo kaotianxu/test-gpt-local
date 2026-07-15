@@ -21,6 +21,7 @@ dev = [
 line-length = 100
 indent-width = 4
 target-version = "py312"
+exclude = [".claude", "output", "data", "logs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]

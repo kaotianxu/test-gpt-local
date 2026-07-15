@@ -1,8 +1,47 @@
 projects:
-  quant-platform:
+  phase4-order-fixture:
+    name: Phase 4 Order Fixture
+    repository: C:/Users/20906/OneDrive - University of Illinois - Urbana/文档/test-gpt-local/output/phase4-fixture
+    worktree_root: E:/GPTWorktrees/phase4-order-fixture
+
+    pwsh:
+      executable: C:/Program Files/PowerShell/7/pwsh.exe
+      default_timeout_seconds: 60
+      max_timeout_seconds: 120
+      max_output_chars: 200000
+      inherit_user_environment: true
+
+    checks:
+      unit_tests:
+        script: |
+          python -m pytest -q
+        timeout_seconds: 60
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTEST_ADDOPTS: "-p no:cacheprovider"
+
+      lint:
+        script: |
+          python -m ruff check .
+        timeout_seconds: 60
+
+      typecheck:
+        script: |
+          python -m mypy .
+        timeout_seconds: 60
+
+      git_tests:
+        description: Legacy check ID; verifies diff whitespace and reports working-tree state separately.
+        result_semantics: git_diff_check
+        script: |
+          git status --short
+          git diff --check
+        timeout_seconds: 60
+
+  Gpt-Local:
     name: Gpt-Local
     repository: C:/OD-UIUC/文档/test-gpt-local
-    worktree_root: D:/GPTWorktrees/gpt-local
+    worktree_root: E:/GPTWorktrees/gpt-local
 
     pwsh:
       executable: C:/Program Files/PowerShell/7/pwsh.exe
@@ -16,6 +55,9 @@ projects:
         script: |
           python -m pytest -q
         timeout_seconds: 1800
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTEST_ADDOPTS: "-p no:cacheprovider"
 
       lint:
         script: |
@@ -24,10 +66,12 @@ projects:
 
       typecheck:
         script: |
-          python -m mypy src
+          python -m mypy app
         timeout_seconds: 900
 
       git_tests:
+        description: Legacy check ID; verifies diff whitespace and reports working-tree state separately.
+        result_semantics: git_diff_check
         script: |
           git status --short
           git diff --check
