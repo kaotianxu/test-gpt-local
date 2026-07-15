@@ -37,9 +37,11 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from app.services.envelope import error_result, ok_result
 from app.services.path_guard import is_denied, resolve_within
 from app.services.workspace_manager import get_workspace
 from app.storage import database as db
+from app.storage.idempotency import with_idempotency
 
 log = logging.getLogger(__name__)
 
@@ -416,6 +418,7 @@ def _apply_patch(
     explanation: str,
     check_only: bool = False,
     expected_sha256: dict[str, str] | None = None,
+    expected_head: str | None = None,
 ) -> dict[str, Any]:
     """Validate and apply a unified diff patch to a workspace.
 
@@ -430,25 +433,30 @@ def _apply_patch(
     # ---- 1. Look up workspace ----
     record = get_workspace(workspace_id)
     if record is None:
-        return {
-            "error": f"workspace not found: {workspace_id}",
-            "workspace_id": workspace_id,
-        }
+        return error_result("WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id)
     worktree = Path(record["worktree_path"])
     if not worktree.exists():
-        return {
-            "error": f"worktree path missing on disk: {worktree}",
-            "workspace_id": workspace_id,
-        }
+        return error_result("STALE_WORKSPACE", f"worktree path missing on disk: {worktree}", workspace_id=workspace_id)
 
     # Basic input validation.
     if not patch or not patch.strip():
-        return {"error": "patch must be a non-empty string", "workspace_id": workspace_id}
+        return error_result("INVALID_INPUT", "patch must be a non-empty string", workspace_id=workspace_id)
     if len(patch) > _MAX_PATCH_CHARS:
-        return {
-            "error": f"patch exceeds maximum size of {_MAX_PATCH_CHARS} characters",
-            "workspace_id": workspace_id,
-        }
+        return error_result("INVALID_INPUT", f"patch exceeds maximum size of {_MAX_PATCH_CHARS} characters", workspace_id=workspace_id)
+
+    # ---- 1b. Validate expected_head if provided ----
+    if expected_head is not None:
+        head_proc = _run_git(worktree, ["git", "rev-parse", "HEAD"])
+        if head_proc.get("exit_code", 1) != 0:
+            return error_result("INTERNAL_ERROR", "could not read workspace HEAD", workspace_id=workspace_id)
+        actual_head = head_proc.get("stdout", "").strip()
+        if actual_head != expected_head:
+            return error_result(
+                "FILE_CHANGED",
+                f"workspace HEAD changed since it was read: expected {expected_head[:12]}, actual {actual_head[:12]}",
+                workspace_id=workspace_id,
+                extra={"expected_head": expected_head, "actual_head": actual_head, "applied": False, "check_only": check_only},
+            )
 
     # ---- 2. Strip wrappers and normalise line endings ----
     stripped = _strip_patch_wrappers(patch)
@@ -459,23 +467,14 @@ def _apply_patch(
         and re.search(r"^\+\+\+\s+", stripped, re.MULTILINE)
     )
     if not has_diff_header:
-        return {
-            "error": (
-                "No unified diff headers found in the input. "
-                "Expected format: a unified diff with ``---`` and ``+++`` "
-                "file headers followed by ``@@`` hunk headers. "
-                "Example:\n\n"
-                "--- a/path/to/file.py\n"
-                "+++ b/path/to/file.py\n"
-                "@@ -1,3 +1,4 @@\n"
-                " line1\n"
-                "-old line\n"
-                "+new line\n"
-            ),
-            "workspace_id": workspace_id,
-            "applied": False,
-            "check_only": check_only,
-        }
+        return error_result(
+            "INVALID_INPUT",
+            "No unified diff headers found in the input. "
+            "Expected format: a unified diff with ``---`` and ``+++`` "
+            "file headers followed by ``@@`` hunk headers.",
+            workspace_id=workspace_id,
+            extra={"applied": False, "check_only": check_only},
+        )
 
     # ---- 3. Validate syntax, paths, and optional optimistic-lock hashes ----
     op_id = uuid.uuid4().hex[:12]
@@ -491,14 +490,17 @@ def _apply_patch(
             success=False,
         )
         db.complete_operation(op_id)
-        return {
-            "error": "patch is not a valid unified diff",
-            "error_type": "format_error",
-            **parser_diagnostic,
-            "workspace_id": workspace_id,
-            "applied": False,
-            "check_only": check_only,
-        }
+        return error_result(
+            "INVALID_INPUT",
+            "patch is not a valid unified diff",
+            extra={
+                "error_type": "format_error",
+                **parser_diagnostic,
+                "workspace_id": workspace_id,
+                "applied": False,
+                "check_only": check_only,
+            },
+        )
 
     try:
         _validate_patch_paths(stripped)
@@ -511,12 +513,12 @@ def _apply_patch(
             success=False,
         )
         db.complete_operation(op_id)
-        return {
-            "error": str(exc),
-            "workspace_id": workspace_id,
-            "applied": False,
-            "check_only": check_only,
-        }
+        return error_result(
+            "PATH_DENIED",
+            str(exc),
+            workspace_id=workspace_id,
+            extra={"applied": False, "check_only": check_only},
+        )
 
     if expected_sha256:
         for relative_path, expected in expected_sha256.items():
@@ -527,27 +529,28 @@ def _apply_patch(
             try:
                 candidate.relative_to(worktree.resolve())
             except ValueError:
-                return {
-                    "error": f"expected_sha256 path escapes workspace: {relative_path!r}",
-                    "error_type": "stale_content",
-                    "workspace_id": workspace_id,
-                    "applied": False,
-                    "check_only": check_only,
-                }
+                return error_result(
+                    "PATH_DENIED",
+                    f"expected_sha256 path escapes workspace: {relative_path!r}",
+                    workspace_id=workspace_id,
+                    extra={"applied": False, "check_only": check_only},
+                )
             actual = (
                 hashlib.sha256(candidate.read_bytes()).hexdigest() if candidate.is_file() else None
             )
             if actual != expected:
-                return {
-                    "error": f"file changed since it was read: {normalised_path}",
-                    "error_type": "stale_content",
-                    "path": normalised_path,
-                    "expected_sha256": expected,
-                    "actual_sha256": actual,
-                    "workspace_id": workspace_id,
-                    "applied": False,
-                    "check_only": check_only,
-                }
+                return error_result(
+                    "FILE_CHANGED",
+                    f"file changed since it was read: {normalised_path}",
+                    workspace_id=workspace_id,
+                    extra={
+                        "path": normalised_path,
+                        "expected_sha256": expected,
+                        "actual_sha256": actual,
+                        "applied": False,
+                        "check_only": check_only,
+                    },
+                )
 
     # ---- 4. git apply --check (dry-run) ----
     git = _git_executable()
@@ -566,7 +569,6 @@ def _apply_patch(
         )
         db.complete_operation(op_id)
         response: dict[str, Any] = {
-            "error": "patch did not apply cleanly",
             "error_type": error_type,
             "check_details": detail,
             "workspace_id": workspace_id,
@@ -587,7 +589,7 @@ def _apply_patch(
                     "normalized_patch_preview": _diagnostic_preview(stripped, line_number),
                 }
             )
-        return response
+        return error_result("PATCH_CONFLICT", "patch did not apply cleanly", workspace_id=workspace_id, extra=response)
 
     # If check_only, stop here.
     if check_only:
@@ -600,16 +602,19 @@ def _apply_patch(
         )
         db.complete_operation(op_id)
         file_changes = _extract_file_changes(stripped)
-        return {
-            "workspace_id": workspace_id,
-            "explanation": explanation,
-            "applied": False,
-            "check_only": True,
-            "check_passed": True,
-            "check_details": "Patch applies cleanly.",
-            "changed_files": _extract_changed_files(stripped),
-            "file_changes": file_changes,
-        }
+        return ok_result(
+            {
+                "workspace_id": workspace_id,
+                "explanation": explanation,
+                "applied": False,
+                "check_only": True,
+                "check_passed": True,
+                "check_details": "Patch applies cleanly.",
+                "changed_files": _extract_changed_files(stripped),
+                "file_changes": file_changes,
+            },
+            workspace_id=workspace_id,
+        )
 
     # ---- 5. git apply -- (apply via stdin) ----
     apply = _run_git(worktree, [git, "apply", "--"], input_str=stripped)
@@ -626,14 +631,17 @@ def _apply_patch(
             success=False,
         )
         db.complete_operation(op_id)
-        return {
-            "error": "git apply failed",
-            "error_type": error_type,
-            "apply_details": detail,
-            "workspace_id": workspace_id,
-            "applied": False,
-            "check_only": check_only,
-        }
+        return error_result(
+            "PATCH_CONFLICT",
+            "git apply failed",
+            workspace_id=workspace_id,
+            extra={
+                "error_type": error_type,
+                "apply_details": detail,
+                "applied": False,
+                "check_only": check_only,
+            },
+        )
 
     # ---- 6. Capture git status, diff stat, and the actual diff ----
     status_result = _run_git(worktree, [git, "status", "--short", "--branch"])
@@ -653,18 +661,21 @@ def _apply_patch(
     )
     db.complete_operation(op_id)
 
-    return {
-        "workspace_id": workspace_id,
-        "explanation": explanation,
-        "applied": True,
-        "check_only": False,
-        "changed_files": changed_files,
-        "file_changes": file_changes,
-        "change_kind": change_kind,
-        "diff_stat": diff_stat_result.get("stdout", "").strip(),
-        "diff": diff_result.get("stdout", "").strip(),
-        "git_status": status_result.get("stdout", "").strip(),
-    }
+    return ok_result(
+        {
+            "workspace_id": workspace_id,
+            "explanation": explanation,
+            "applied": True,
+            "check_only": False,
+            "changed_files": changed_files,
+            "file_changes": file_changes,
+            "change_kind": change_kind,
+            "diff_stat": diff_stat_result.get("stdout", "").strip(),
+            "diff": diff_result.get("stdout", "").strip(),
+            "git_status": status_result.get("stdout", "").strip(),
+        },
+        workspace_id=workspace_id,
+    )
 
 
 def _run_git(
@@ -709,67 +720,48 @@ def _replace_text(
     """Perform an exact, concurrency-safe text replacement in one file."""
     record = get_workspace(workspace_id)
     if record is None:
-        return {"error": f"workspace not found: {workspace_id}", "workspace_id": workspace_id}
+        return error_result("WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id)
     worktree = Path(record["worktree_path"])
     try:
         target = resolve_within(worktree, path)
     except ValueError as exc:
-        return {"error": str(exc), "workspace_id": workspace_id, "path": path}
+        return error_result("PATH_DENIED", str(exc), workspace_id=workspace_id)
     if is_denied(target, worktree):
-        return {
-            "error": "path is denied by policy",
-            "workspace_id": workspace_id,
-            "path": path,
-        }
+        return error_result("PATH_DENIED", "path is denied by policy", workspace_id=workspace_id)
     if not target.is_file():
-        return {
-            "error": "path is not a regular file",
-            "workspace_id": workspace_id,
-            "path": path,
-        }
+        return error_result("INVALID_INPUT", "path is not a regular file", workspace_id=workspace_id)
     if not old_text:
-        return {
-            "error": "old_text must be non-empty",
-            "workspace_id": workspace_id,
-            "path": path,
-        }
+        return error_result("INVALID_INPUT", "old_text must be non-empty", workspace_id=workspace_id)
 
     raw = target.read_bytes()
     actual_sha256 = hashlib.sha256(raw).hexdigest()
     if expected_sha256 is not None and actual_sha256 != expected_sha256:
-        return {
-            "error": f"file changed since it was read: {path}",
-            "error_type": "stale_content",
-            "expected_sha256": expected_sha256,
-            "actual_sha256": actual_sha256,
-            "workspace_id": workspace_id,
-            "path": path,
-        }
+        return error_result(
+            "FILE_CHANGED",
+            f"file changed since it was read: {path}",
+            workspace_id=workspace_id,
+            extra={
+                "error_type": "stale_content",
+                "expected_sha256": expected_sha256,
+                "actual_sha256": actual_sha256,
+                "path": path,
+            },
+        )
     try:
         content = raw.decode("utf-8")
     except UnicodeDecodeError:
-        return {
-            "error": "file is not valid UTF-8 text",
-            "workspace_id": workspace_id,
-            "path": path,
-        }
+        return error_result("INVALID_INPUT", "file is not valid UTF-8 text", workspace_id=workspace_id)
 
     occurrences = content.count(old_text)
     if occurrences == 0:
-        return {
-            "error": "old_text was not found",
-            "error_type": "conflict",
-            "workspace_id": workspace_id,
-            "path": path,
-        }
+        return error_result("PATCH_CONFLICT", "old_text was not found", workspace_id=workspace_id, extra={"error_type": "conflict", "path": path})
     if occurrences > 1 and not replace_all:
-        return {
-            "error": "old_text is ambiguous; set replace_all=true or provide more context",
-            "error_type": "conflict",
-            "occurrences": occurrences,
-            "workspace_id": workspace_id,
-            "path": path,
-        }
+        return error_result(
+            "PATCH_CONFLICT",
+            "old_text is ambiguous; set replace_all=true or provide more context",
+            workspace_id=workspace_id,
+            extra={"error_type": "conflict", "occurrences": occurrences, "path": path},
+        )
 
     updated = content.replace(old_text, new_text, -1 if replace_all else 1)
     temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
@@ -793,18 +785,21 @@ def _replace_text(
         success=True,
     )
     db.complete_operation(op_id)
-    return {
-        "workspace_id": workspace_id,
-        "path": path,
-        "replacements": occurrences if replace_all else 1,
-        "changed_files": [path],
-        "file_changes": [{"path": path, "status": "modified"}],
-        "sha256_before": actual_sha256,
-        "sha256_after": hashlib.sha256(target.read_bytes()).hexdigest(),
-        "diff_stat": diff_stat.get("stdout", "").strip(),
-        "diff": diff.get("stdout", "").strip(),
-        "git_status": status.get("stdout", "").strip(),
-    }
+    return ok_result(
+        {
+            "workspace_id": workspace_id,
+            "path": path,
+            "replacements": occurrences if replace_all else 1,
+            "changed_files": [path],
+            "file_changes": [{"path": path, "status": "modified"}],
+            "sha256_before": actual_sha256,
+            "sha256_after": hashlib.sha256(target.read_bytes()).hexdigest(),
+            "diff_stat": diff_stat.get("stdout", "").strip(),
+            "diff": diff.get("stdout", "").strip(),
+            "git_status": status.get("stdout", "").strip(),
+        },
+        workspace_id=workspace_id,
+    )
 
 
 # ── Tool registration ──────────────────────────────────────────────────
@@ -843,7 +838,11 @@ def register_tools(mcp: FastMCP) -> None:
             " structured ``file_changes`` (added/modified/deleted/renamed),"
             " ``change_kind`` (code/docs/config/mixed), ``diff_stat``,"
             " ``diff`` (the actual changes), and ``git_status`` so you can"
-            " inspect what changed without a separate tool call."
+            " inspect what changed without a separate tool call.\n\n"
+            "**Idempotency:**\n"
+            "Pass an ``idempotency_key`` to safely retry this call."
+            " When the same key is used with the same inputs, the server"
+            " returns the cached result without reapplying the patch."
         ),
         annotations=ToolAnnotations(
             readOnlyHint=False,
@@ -858,6 +857,8 @@ def register_tools(mcp: FastMCP) -> None:
         explanation: str,
         check_only: bool = False,
         expected_sha256: dict[str, str] | None = None,
+        expected_head: str | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, object]:
         """Apply a unified diff to the workspace.
 
@@ -873,20 +874,37 @@ def register_tools(mcp: FastMCP) -> None:
             expected_sha256: Optional mapping of relative file paths to hashes
                 returned by read_files. The patch is rejected if any file has
                 changed since it was read.
+            expected_head: Optional expected HEAD commit hash. The patch is
+                rejected if the workspace HEAD does not match.
+            idempotency_key: Optional key for idempotent retry. When provided,
+                duplicate requests with the same key return the cached result.
         """
         log.info(
-            "apply_patch workspace_id=%s explanation=%s patch_len=%d check_only=%s",
+            "apply_patch workspace_id=%s explanation=%s patch_len=%d check_only=%s idempotency_key=%s",
             workspace_id,
             explanation,
             len(patch),
             check_only,
+            idempotency_key,
         )
-        return _apply_patch(
-            workspace_id,
-            patch,
-            explanation,
-            check_only,
-            expected_sha256,
+        return with_idempotency(
+            idempotency_key,
+            "apply_patch",
+            {
+                "workspace_id": workspace_id,
+                "patch_sha256": hashlib.sha256(patch.encode("utf-8")).hexdigest(),
+                "explanation_sha256": hashlib.sha256(explanation.encode("utf-8")).hexdigest(),
+                "check_only": check_only,
+                "expected_head": expected_head,
+            },
+            lambda: _apply_patch(
+                workspace_id,
+                patch,
+                explanation,
+                check_only,
+                expected_sha256,
+                expected_head,
+            ),
         )
 
     @mcp.tool(
@@ -913,20 +931,33 @@ def register_tools(mcp: FastMCP) -> None:
         explanation: str,
         expected_sha256: str | None = None,
         replace_all: bool = False,
+        idempotency_key: str | None = None,
     ) -> dict[str, object]:
         """Perform an exact text replacement inside a workspace file."""
         log.info(
-            "replace_text workspace_id=%s path=%s explanation=%s",
+            "replace_text workspace_id=%s path=%s explanation=%s idempotency_key=%s",
             workspace_id,
             path,
             explanation,
+            idempotency_key,
         )
-        return _replace_text(
-            workspace_id,
-            path,
-            old_text,
-            new_text,
-            explanation,
-            expected_sha256,
-            replace_all,
+        return with_idempotency(
+            idempotency_key,
+            "replace_text",
+            {
+                "workspace_id": workspace_id,
+                "path": path,
+                "old_text_sha256": hashlib.sha256(old_text.encode("utf-8")).hexdigest(),
+                "new_text_sha256": hashlib.sha256(new_text.encode("utf-8")).hexdigest(),
+                "replace_all": replace_all,
+            },
+            lambda: _replace_text(
+                workspace_id,
+                path,
+                old_text,
+                new_text,
+                explanation,
+                expected_sha256,
+                replace_all,
+            ),
         )

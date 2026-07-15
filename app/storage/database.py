@@ -93,6 +93,16 @@ def init_db(db_path: str | Path | None = None) -> None:
         conn.execute("ALTER TABLE workspaces ADD COLUMN main_status_at_creation TEXT")
     if "main_status_sha256_at_creation" not in workspace_columns:
         conn.execute("ALTER TABLE workspaces ADD COLUMN main_status_sha256_at_creation TEXT")
+    if "revision" not in workspace_columns:
+        conn.execute("ALTER TABLE workspaces ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
+    if "current_head" not in workspace_columns:
+        conn.execute("ALTER TABLE workspaces ADD COLUMN current_head TEXT")
+    if "last_patch_at" not in workspace_columns:
+        conn.execute("ALTER TABLE workspaces ADD COLUMN last_patch_at TEXT")
+    if "last_check" not in workspace_columns:
+        conn.execute("ALTER TABLE workspaces ADD COLUMN last_check TEXT")
+    if "changed_files" not in workspace_columns:
+        conn.execute("ALTER TABLE workspaces ADD COLUMN changed_files TEXT")
     legacy_statuses = conn.execute(
         """SELECT workspace_id, main_status_at_creation FROM workspaces
            WHERE main_status_at_creation IS NOT NULL
@@ -128,8 +138,8 @@ def insert_workspace(
         """INSERT INTO workspaces
            (workspace_id, project_id, task_name, worktree_path, base_commit,
             status, created_at, last_accessed_at, main_head_at_creation,
-            main_status_sha256_at_creation)
-           VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)""",
+            main_status_sha256_at_creation, revision, current_head)
+           VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, 1, ?)""",
         (
             workspace_id,
             project_id,
@@ -140,6 +150,7 @@ def insert_workspace(
             now,
             main_head_at_creation,
             main_status_sha256_at_creation,
+            base_commit,
         ),
     )
     conn.commit()
@@ -216,6 +227,31 @@ def delete_workspace(workspace_id: str) -> None:
     except Exception:
         conn.rollback()
         raise
+
+
+def increment_workspace_revision(workspace_id: str) -> int:
+    """Increment the revision counter and return the new value."""
+    conn = _get_connection()
+    conn.execute(
+        "UPDATE workspaces SET revision = revision + 1 WHERE workspace_id = ?",
+        (workspace_id,),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT revision FROM workspaces WHERE workspace_id = ?", (workspace_id,)
+    ).fetchone()
+    return int(row["revision"]) if row else 0
+
+
+def update_workspace_metadata(workspace_id: str, **kwargs: str | None) -> None:
+    """Update arbitrary workspace metadata fields."""
+    if not kwargs:
+        return
+    conn = _get_connection()
+    set_clause = ", ".join(f"{k} = ?" for k in kwargs)
+    values = list(kwargs.values()) + [workspace_id]
+    conn.execute(f"UPDATE workspaces SET {set_clause} WHERE workspace_id = ?", values)
+    conn.commit()
 
 
 # ---- Process helpers ----

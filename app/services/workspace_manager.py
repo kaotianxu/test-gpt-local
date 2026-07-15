@@ -120,6 +120,124 @@ def _active_count(project_id: str) -> int:
     return sum(1 for w in db.list_workspaces(project_id) if w["status"] == "active")
 
 
+def _discover_project_manifest(repo: Path) -> dict[str, Any]:
+    """Scan the repository for well-known files and return a project manifest.
+
+    The manifest helps GPT understand the project structure without
+    additional tool calls.
+    """
+    manifest: dict[str, Any] = {
+        "languages": [],
+        "instructions": [],
+        "test_commands": [],
+        "package_manager": None,
+        "entrypoints": [],
+        "project_config_files": [],
+        "git_head": None,
+    }
+
+    # Capture HEAD.
+    head_proc = _run_git(["rev-parse", "HEAD"], cwd=repo, check=False)
+    if head_proc.returncode == 0:
+        manifest["git_head"] = head_proc.stdout.strip()
+
+    # Walk well-known files.
+    for fname in ("AGENTS.md", "CONTRIBUTING.md", "README.md", "README.rst"):
+        if (repo / fname).is_file():
+            manifest["instructions"].append(fname)
+
+    # Detect project config files and language.
+    if (repo / "pyproject.toml").is_file():
+        manifest["project_config_files"].append("pyproject.toml")
+        manifest["languages"].append("python")
+        # Detect package manager from pyproject.toml content.
+        try:
+            text = (repo / "pyproject.toml").read_text(encoding="utf-8", errors="replace")
+            if "[tool.uv]" in text or "uv" in text:
+                manifest["package_manager"] = "uv"
+            elif "[tool.poetry]" in text:
+                manifest["package_manager"] = "poetry"
+            elif "[project]" in text:
+                manifest["package_manager"] = "pip"
+        except OSError:
+            pass
+
+    if (repo / "package.json").is_file():
+        manifest["project_config_files"].append("package.json")
+        if "javascript" not in manifest["languages"] and "typescript" not in manifest["languages"]:
+            manifest["languages"].append("javascript")
+        if "typescript" not in manifest["languages"]:
+            # Check for tsconfig.json or TypeScript dependencies.
+            if (repo / "tsconfig.json").is_file():
+                manifest["languages"].append("typescript")
+        try:
+            import json as _json
+
+            pkg = _json.loads((repo / "package.json").read_text(encoding="utf-8"))
+            if not manifest["package_manager"]:
+                manifest["package_manager"] = "npm"
+        except (OSError, _json.JSONDecodeError):
+            pass
+
+    if (repo / "Cargo.toml").is_file():
+        manifest["project_config_files"].append("Cargo.toml")
+        manifest["languages"].append("rust")
+        if not manifest["package_manager"]:
+            manifest["package_manager"] = "cargo"
+
+    if (repo / "Makefile").is_file():
+        manifest["project_config_files"].append("Makefile")
+
+    if (repo / "Gemfile").is_file():
+        manifest["project_config_files"].append("Gemfile")
+        manifest["languages"].append("ruby")
+        if not manifest["package_manager"]:
+            manifest["package_manager"] = "bundler"
+
+    # Scan for .sln and .csproj files.
+    sln_files = list(repo.glob("*.sln"))
+    csproj_files = list(repo.glob("**/*.csproj"))
+    if sln_files:
+        manifest["project_config_files"].extend(str(f.relative_to(repo)) for f in sln_files[:3])
+        manifest["languages"].append("csharp")
+    if csproj_files:
+        manifest["project_config_files"].extend(
+            str(f.relative_to(repo)) for f in csproj_files[:3]
+        )
+        if "csharp" not in manifest["languages"]:
+            manifest["languages"].append("csharp")
+        if not manifest["package_manager"]:
+            manifest["package_manager"] = "nuget"
+
+    # Discover entrypoints via simple heuristics.
+    py_files = list(repo.rglob("*.py"))
+    for pyf in py_files:
+        if pyf.name == "__main__.py":
+            rel = str(pyf.relative_to(repo))
+            if rel not in manifest["entrypoints"]:
+                manifest["entrypoints"].append(rel)
+            break
+    for pyf in py_files:
+        try:
+            text = pyf.read_text(encoding="utf-8", errors="replace")
+            if 'if __name__ == "__main__"' in text or "def main()" in text:
+                rel = str(pyf.relative_to(repo))
+                if rel not in manifest["entrypoints"]:
+                    manifest["entrypoints"].append(rel)
+            if len(manifest["entrypoints"]) >= 5:
+                break
+        except OSError:
+            continue
+
+    # Deduplicate languages.
+    seen_langs: set[str] = set()
+    manifest["languages"] = [
+        lang for lang in manifest["languages"] if lang not in seen_langs and not seen_langs.add(lang)  # type: ignore[func-returns-value]
+    ]
+
+    return manifest
+
+
 def create_workspace(project_id: str, task_name: str) -> dict[str, Any]:
     """Create a detached Git worktree for a project task.
 
@@ -196,6 +314,10 @@ def create_workspace(project_id: str, task_name: str) -> dict[str, Any]:
             main_status_result.stdout.encode("utf-8")
         ).hexdigest(),
     )
+
+    # Attach project manifest.
+    manifest = _discover_project_manifest(repo)
+    record["project_manifest"] = manifest
     return record
 
 

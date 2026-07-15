@@ -17,6 +17,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from app.config import get_files_config
+from app.services.envelope import error_result, ok_result
 from app.services.path_guard import is_denied, resolve_within
 from app.services.workspace_manager import get_workspace
 
@@ -111,14 +112,11 @@ def _read_files(
 ) -> dict[str, Any]:
     record = get_workspace(workspace_id)
     if record is None:
-        return {
-            "error": f"workspace not found: {workspace_id}",
-            "workspace_id": workspace_id,
-        }
+        return error_result("WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id)
     worktree = Path(record["worktree_path"])
 
     if not items:
-        return {"error": "items must be a non-empty list", "workspace_id": workspace_id}
+        return error_result("INVALID_INPUT", "items must be a non-empty list", workspace_id=workspace_id)
 
     cfg = get_files_config()
     max_chars = int(cfg.get("max_read_chars", _DEFAULT_MAX_CHARS))
@@ -134,11 +132,14 @@ def _read_files(
             if remaining <= 0:
                 break
 
-    return {
-        "workspace_id": workspace_id,
-        "files": results,
-        "remaining_chars": max(remaining, 0),
-    }
+    return ok_result(
+        {
+            "workspace_id": workspace_id,
+            "files": results,
+            "remaining_chars": max(remaining, 0),
+        },
+        workspace_id=workspace_id,
+    )
 
 
 def register_tools(mcp: FastMCP) -> None:

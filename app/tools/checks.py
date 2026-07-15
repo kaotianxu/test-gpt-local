@@ -20,8 +20,10 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from app.config import get_process_config, get_project
+from app.services.envelope import error_result, ok_result
 from app.services.process_manager import ProcessManager
 from app.services.workspace_manager import get_workspace
+from app.storage.idempotency import with_idempotency
 
 log = logging.getLogger(__name__)
 
@@ -32,34 +34,31 @@ def _list_checks(workspace_id: str) -> dict[str, Any]:
     """Return the available checks for the workspace's project."""
     record = get_workspace(workspace_id)
     if record is None:
-        return {
-            "error": f"workspace not found: {workspace_id}",
-            "workspace_id": workspace_id,
-        }
+        return error_result("WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id)
 
     project = get_project(record["project_id"])
     if project is None:
-        return {
-            "error": f"project config not found: {record['project_id']}",
-            "workspace_id": workspace_id,
-        }
+        return error_result("PROJECT_NOT_FOUND", f"project config not found: {record['project_id']}", workspace_id=workspace_id)
 
     checks = project.get("checks", {})
-    return {
-        "workspace_id": workspace_id,
-        "project_id": record["project_id"],
-        "checks": [
-            {
-                "check_id": cid,
-                "timeout_seconds": info.get("timeout_seconds", 600),
-                "script_preview": (info.get("script", "") or "")[:200],
-                "description": info.get("description", ""),
-                "result_semantics": info.get("result_semantics", "command_exit"),
-                "environment_keys": sorted((info.get("env") or {}).keys()),
-            }
-            for cid, info in checks.items()
-        ],
-    }
+    return ok_result(
+        {
+            "workspace_id": workspace_id,
+            "project_id": record["project_id"],
+            "checks": [
+                {
+                    "check_id": cid,
+                    "timeout_seconds": info.get("timeout_seconds", 600),
+                    "script_preview": (info.get("script", "") or "")[:200],
+                    "description": info.get("description", ""),
+                    "result_semantics": info.get("result_semantics", "command_exit"),
+                    "environment_keys": sorted((info.get("env") or {}).keys()),
+                }
+                for cid, info in checks.items()
+            ],
+        },
+        workspace_id=workspace_id,
+    )
 
 
 def _run_check(
@@ -74,45 +73,30 @@ def _run_check(
     # ---- 1. Look up workspace and project ----
     record = get_workspace(workspace_id)
     if record is None:
-        return {
-            "error": f"workspace not found: {workspace_id}",
-            "workspace_id": workspace_id,
-        }
+        return error_result("WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id)
     worktree = Path(record["worktree_path"])
     if not worktree.exists():
-        return {
-            "error": f"worktree path missing on disk: {worktree}",
-            "workspace_id": workspace_id,
-        }
+        return error_result("STALE_WORKSPACE", f"worktree path missing on disk: {worktree}", workspace_id=workspace_id)
 
     project = get_project(record["project_id"])
     if project is None:
-        return {
-            "error": f"project config not found: {record['project_id']}",
-            "workspace_id": workspace_id,
-        }
+        return error_result("PROJECT_NOT_FOUND", f"project config not found: {record['project_id']}", workspace_id=workspace_id)
 
     # ---- 2. Look up check config ----
     checks = project.get("checks", {})
     check_cfg = checks.get(check_id)
     if check_cfg is None:
         available = ", ".join(sorted(checks.keys()))
-        return {
-            "error": (
-                f"check_id {check_id!r} not found in project "
-                f"{record['project_id']!r}. Available checks: [{available}]"
-            ),
-            "workspace_id": workspace_id,
-            "check_id": check_id,
-        }
+        return error_result(
+            "CHECK_NOT_FOUND",
+            f"check_id {check_id!r} not found in project {record['project_id']!r}. Available checks: [{available}]",
+            workspace_id=workspace_id,
+            extra={"check_id": check_id, "available_checks": sorted(checks.keys())},
+        )
 
     script = check_cfg.get("script", "").strip()
     if not script:
-        return {
-            "error": f"check {check_id!r} has an empty script",
-            "workspace_id": workspace_id,
-            "check_id": check_id,
-        }
+        return error_result("INVALID_INPUT", f"check {check_id!r} has an empty script", workspace_id=workspace_id, extra={"check_id": check_id})
 
     timeout = check_cfg.get("timeout_seconds")
     if timeout is None:
@@ -128,11 +112,7 @@ def _run_check(
         isinstance(key, str) and isinstance(value, (str, int, float, bool))
         for key, value in configured_env.items()
     ):
-        return {
-            "error": f"check {check_id!r} has an invalid env mapping",
-            "workspace_id": workspace_id,
-            "check_id": check_id,
-        }
+        return error_result("INVALID_INPUT", f"check {check_id!r} has an invalid env mapping", workspace_id=workspace_id, extra={"check_id": check_id})
     check_env = {str(key): str(value) for key, value in configured_env.items()}
     check_env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
@@ -151,7 +131,7 @@ def _run_check(
             tool_name=f"run_check:{check_id}",
         )
     except RuntimeError as exc:
-        return {"error": str(exc), "workspace_id": workspace_id, "check_id": check_id}
+        return error_result("RATE_LIMITED", str(exc), workspace_id=workspace_id, extra={"check_id": check_id})
 
     process_id = spawn_result["process_id"]
 
@@ -168,7 +148,7 @@ def _run_check(
                 result["workspace_id"] = workspace_id
                 if check_cfg.get("result_semantics") == "git_diff_check":
                     result["git_hygiene"] = _git_hygiene(worktree, result)
-                return result
+                return ok_result(result, workspace_id=workspace_id)
             time.sleep(_WAIT_POLL_INTERVAL)
 
         pm.cancel(process_id)
@@ -177,14 +157,17 @@ def _run_check(
         result["workspace_id"] = workspace_id
         if check_cfg.get("result_semantics") == "git_diff_check":
             result["git_hygiene"] = _git_hygiene(worktree, result)
-        return result
+        return ok_result(result, workspace_id=workspace_id)
 
-    return {
-        "process_id": process_id,
-        "status": "running",
-        "workspace_id": workspace_id,
-        "check_id": check_id,
-    }
+    return ok_result(
+        {
+            "process_id": process_id,
+            "status": "running",
+            "workspace_id": workspace_id,
+            "check_id": check_id,
+        },
+        workspace_id=workspace_id,
+    )
 
 
 def _git_hygiene(worktree: Path, process_result: dict[str, Any]) -> dict[str, Any]:
@@ -276,6 +259,7 @@ def register_tools(mcp: FastMCP) -> None:
         workspace_id: str,
         check_id: str,
         wait: bool = True,
+        idempotency_key: str | None = None,
     ) -> dict[str, object]:
         """Execute a pre-configured check script.
 
@@ -286,6 +270,12 @@ def register_tools(mcp: FastMCP) -> None:
             wait: When ``True`` (default), block until the check finishes
                 and return the full result.  When ``False``, return
                 immediately with a ``process_id`` for later polling.
+            idempotency_key: Optional key for idempotent retry.
         """
-        log.info("run_check workspace_id=%s check_id=%s wait=%s", workspace_id, check_id, wait)
-        return _run_check(workspace_id, check_id, wait)
+        log.info("run_check workspace_id=%s check_id=%s wait=%s idempotency_key=%s", workspace_id, check_id, wait, idempotency_key)
+        return with_idempotency(
+            idempotency_key,
+            "run_check",
+            {"workspace_id": workspace_id, "check_id": check_id, "wait": wait},
+            lambda: _run_check(workspace_id, check_id, wait),
+        )

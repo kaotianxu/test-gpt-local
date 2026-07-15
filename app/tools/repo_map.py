@@ -14,6 +14,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from app.services.envelope import error_result, ok_result
 from app.services.path_guard import is_denied, resolve_within
 from app.services.workspace_manager import get_workspace
 
@@ -83,7 +84,7 @@ def _build_tree(
 def _repo_map(workspace_id: str, path: str = "") -> dict[str, Any]:
     record = get_workspace(workspace_id)
     if record is None:
-        return {"error": f"workspace not found: {workspace_id}", "workspace_id": workspace_id}
+        return error_result("WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id)
     worktree = Path(record["worktree_path"])
 
     if path.strip() == "":
@@ -95,20 +96,19 @@ def _repo_map(workspace_id: str, path: str = "") -> dict[str, Any]:
             if is_denied(root, worktree):
                 raise ValueError("path is denied by policy")
         except ValueError as exc:
-            return {
-                "error": str(exc),
-                "workspace_id": workspace_id,
-                "path": path,
-            }
+            return error_result("PATH_DENIED", str(exc), workspace_id=workspace_id)
         rel = path
 
     tree = _build_tree(root, deny_root=worktree)
-    return {
-        "workspace_id": workspace_id,
-        "path": rel,
-        "worktree_path": str(worktree),
-        "tree": tree,
-    }
+    return ok_result(
+        {
+            "workspace_id": workspace_id,
+            "path": rel,
+            "worktree_path": str(worktree),
+            "tree": tree,
+        },
+        workspace_id=workspace_id,
+    )
 
 
 def register_tools(mcp: FastMCP) -> None:

@@ -17,6 +17,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from app.services.envelope import error_result, ok_result
 from app.services.path_guard import is_denied, resolve_within
 from app.services.workspace_manager import get_workspace
 
@@ -54,22 +55,30 @@ def _validate_path(worktree: Path, path: str) -> Path:
 
 def _search(
     workspace_id: str,
-    query: str,
+    query: str = "",
     path: str = "",
     globs: list[str] | None = None,
     context_lines: int = 2,
     max_results: int = _DEFAULT_MAX_RESULTS,
+    queries: list[str] | None = None,
 ) -> dict[str, Any]:
     record = get_workspace(workspace_id)
     if record is None:
         return {"error": f"workspace not found: {workspace_id}", "workspace_id": workspace_id}
     worktree = Path(record["worktree_path"])
 
+    # Multi-query mode: run several searches and aggregate results.
+    if queries and len(queries) > 1:
+        return _search_multi(workspace_id, worktree, queries, path, globs, context_lines, max_results)
+
     try:
-        q = _validate_query(query)
+        q = _validate_query(query) if query else ""
         target = _validate_path(worktree, path)
     except ValueError as exc:
         return {"error": str(exc), "workspace_id": workspace_id, "query": query}
+
+    if not q:
+        return {"error": "query or queries must be provided", "workspace_id": workspace_id}
 
     context_lines = max(0, min(int(context_lines), 10))
     if max_results <= 0:
@@ -190,15 +199,75 @@ def _search(
     truncated = len(raw_matches) > max_results
     matches = raw_matches[:max_results]
 
-    return {
+    return ok_result(
+        {
+            "workspace_id": workspace_id,
+            "query": q,
+            "path": path or ".",
+            "context_lines": context_lines,
+            "match_count": len(matches),
+            "truncated": truncated,
+            "matches": matches,
+        },
+        workspace_id=workspace_id,
+    )
+
+
+def _search_multi(
+    workspace_id: str,
+    worktree: Path,
+    queries: list[str],
+    path: str,
+    globs: list[str] | None,
+    context_lines: int,
+    max_results: int,
+) -> dict[str, Any]:
+    """Run multiple searches and aggregate results grouped by query."""
+    per_query_max = max(1, max_results // max(len(queries), 1))
+    aggregated: list[dict[str, Any]] = []
+    total_count = 0
+    truncated = False
+    errors: list[str] = []
+
+    for q in queries:
+        single = _search(
+            workspace_id=workspace_id,
+            query=q,
+            path=path,
+            globs=globs,
+            context_lines=context_lines,
+            max_results=per_query_max,
+        )
+        # Check for envelope-wrapped error.
+        if not single.get("ok", True):
+            errors.append(f"{q!r}: {single.get('error', {}).get('message', 'unknown error')}")
+            continue
+        result = single.get("result", single)
+        for match in result.get("matches", []):
+            match["query_group"] = q
+            aggregated.append(match)
+        total_count += result.get("match_count", 0)
+        if result.get("truncated"):
+            truncated = True
+
+    # Limit total results.
+    if len(aggregated) > max_results:
+        aggregated = aggregated[:max_results]
+        truncated = True
+
+    result: dict[str, Any] = {
         "workspace_id": workspace_id,
-        "query": q,
+        "queries": queries,
         "path": path or ".",
         "context_lines": context_lines,
-        "match_count": len(matches),
+        "match_count": len(aggregated),
+        "total_matches": total_count,
         "truncated": truncated,
-        "matches": matches,
+        "matches": aggregated,
     }
+    if errors:
+        result["query_errors"] = errors
+    return ok_result(result, workspace_id=workspace_id)
 
 
 def register_tools(mcp: FastMCP) -> None:
@@ -207,7 +276,11 @@ def register_tools(mcp: FastMCP) -> None:
         description=(
             "Search for a literal string or simple regex inside a workspace "
             "using ripgrep. Returns up to max_results matches with a small "
-            "context window. Useful for locating call sites and definitions."
+            "context window. Useful for locating call sites and definitions.\n\n"
+            "**Single query:** pass ``query`` (string) for a single search.\n"
+            "**Multi-query:** pass ``queries`` (list of strings) to run several "
+            "searches in one call. Each result includes a ``query_group`` field "
+            "indicating which query matched it."
         ),
         annotations=ToolAnnotations(
             readOnlyHint=True,
@@ -218,16 +291,18 @@ def register_tools(mcp: FastMCP) -> None:
     )
     async def search_code(
         workspace_id: str,
-        query: str,
+        query: str = "",
         path: str = "",
         globs: list[str] | None = None,
         context_lines: int = 2,
         max_results: int = _DEFAULT_MAX_RESULTS,
+        queries: list[str] | None = None,
     ) -> dict[str, object]:
         log.info(
-            "search_code workspace_id=%s query=%r path=%s globs=%s",
+            "search_code workspace_id=%s query=%r queries=%s path=%s globs=%s",
             workspace_id,
             query,
+            queries,
             path,
             globs,
         )
@@ -238,4 +313,5 @@ def register_tools(mcp: FastMCP) -> None:
             globs=globs,
             context_lines=context_lines,
             max_results=max_results,
+            queries=queries,
         )

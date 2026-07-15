@@ -525,6 +525,7 @@ class ProcessManager:
         status = str(record["status"])
         return {
             "process_id": record["process_id"],
+            "output_artifact_id": record["process_id"],
             "status": status,
             "tool_status": "success",
             "task_status": status,

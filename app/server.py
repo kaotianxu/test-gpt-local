@@ -17,6 +17,7 @@ from app.config import (
 )
 from app.storage.database import init_db
 from app.tools import (
+    capabilities,
     checks,
     git_tools,
     patcher,
@@ -125,6 +126,7 @@ def create_app() -> FastMCP:
 
     # ---- Register MCP tools ----
     projects.register_tools(mcp)
+    capabilities.register_tools(mcp)
     workspaces.register_tools(mcp)
     repo_map.register_tools(mcp)
     search.register_tools(mcp)

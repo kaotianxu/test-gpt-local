@@ -9,6 +9,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from app.config import load_projects_config
+from app.services.envelope import ok_result
 
 
 def register_tools(mcp: FastMCP) -> None:
@@ -26,11 +27,11 @@ def register_tools(mcp: FastMCP) -> None:
     )
     async def ping() -> dict[str, str]:
         """Return a simple pong response to confirm connectivity."""
-        return {
+        return ok_result({
             "status": "ok",
             "service": "gpt-local-code-operator",
-            "version": "0.1.0",
-        }
+            "version": "0.2.0",
+        })
 
     @mcp.tool(
         name="list_projects",
@@ -45,10 +46,10 @@ def register_tools(mcp: FastMCP) -> None:
     async def list_projects() -> list[dict[str, str]]:
         """Return a list of registered projects with their IDs and display names."""
         projects = load_projects_config()
-        return [
+        return ok_result([
             {
                 "project_id": pid,
                 "name": info.get("name", pid),
             }
             for pid, info in projects.items()
-        ]
+        ])

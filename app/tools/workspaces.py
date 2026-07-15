@@ -13,8 +13,37 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from app.services import workspace_manager
+from app.services.envelope import error_result, ok_result
+from app.storage.idempotency import with_idempotency
 
 log = logging.getLogger(__name__)
+
+
+def _do_create_workspace(project_id: str, task_name: str) -> dict[str, object]:
+    """Internal helper that wraps the workspace manager call."""
+    try:
+        result = workspace_manager.create_workspace(project_id, task_name)
+        return ok_result(
+            result,
+            workspace_id=result.get("workspace_id"),
+        )
+    except (ValueError, FileExistsError, RuntimeError) as exc:
+        log.warning("create_workspace failed: %s", exc)
+        return error_result(
+            "WORKSPACE_NOT_FOUND" if "not registered" in str(exc) else "INVALID_INPUT",
+            str(exc),
+            retryable=False,
+        )
+
+
+def _do_discard_workspace(workspace_id: str) -> dict[str, object]:
+    """Internal helper that wraps the workspace manager discard call."""
+    try:
+        result = workspace_manager.discard_workspace(workspace_id)
+        return ok_result(result, workspace_id=workspace_id)
+    except ValueError as exc:
+        log.warning("discard_workspace failed: %s", exc)
+        return error_result("WORKSPACE_NOT_FOUND", str(exc), workspace_id=workspace_id)
 
 
 def register_tools(mcp: FastMCP) -> None:
@@ -27,6 +56,8 @@ def register_tools(mcp: FastMCP) -> None:
             "The worktree lives under the project's worktree_root and is "
             "identified by a short workspace_id. The main repository is "
             "never modified; all changes must happen inside the worktree."
+            "\n\nReturns a ``project_manifest`` with project metadata."
+            "\n\nSupports ``idempotency_key`` for safe retry."
         ),
         annotations=ToolAnnotations(
             readOnlyHint=False,
@@ -38,19 +69,22 @@ def register_tools(mcp: FastMCP) -> None:
     async def create_workspace(
         project_id: str,
         task_name: str,
+        idempotency_key: str | None = None,
     ) -> dict[str, object]:
         """Create a detached worktree for a project task.
 
         Args:
             project_id: must be a key in config/projects.yaml.
             task_name: human-readable label stored in metadata.
+            idempotency_key: Optional key for idempotent retry.
         """
-        log.info("create_workspace project_id=%s task_name=%s", project_id, task_name)
-        try:
-            return workspace_manager.create_workspace(project_id, task_name)
-        except (ValueError, FileExistsError, RuntimeError) as exc:
-            log.warning("create_workspace failed: %s", exc)
-            return {"error": str(exc), "project_id": project_id, "task_name": task_name}
+        log.info("create_workspace project_id=%s task_name=%s idempotency_key=%s", project_id, task_name, idempotency_key)
+        return with_idempotency(
+            idempotency_key,
+            "create_workspace",
+            {"project_id": project_id, "task_name": task_name},
+            lambda: _do_create_workspace(project_id, task_name),
+        )
 
     @mcp.tool(
         name="get_workspace",
@@ -69,8 +103,8 @@ def register_tools(mcp: FastMCP) -> None:
         """Look up a workspace by ID."""
         record = workspace_manager.get_workspace(workspace_id)
         if record is None:
-            return {"error": f"workspace not found: {workspace_id}", "workspace_id": workspace_id}
-        return record
+            return error_result("WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}")
+        return ok_result(record, workspace_id=workspace_id)
 
     @mcp.tool(
         name="list_workspaces",
@@ -86,7 +120,7 @@ def register_tools(mcp: FastMCP) -> None:
         project_id: str | None = None,
     ) -> list[dict[str, object]]:
         """Return the workspace list, optionally filtered by project."""
-        return workspace_manager.list_workspaces(project_id)
+        return ok_result(workspace_manager.list_workspaces(project_id))
 
     @mcp.tool(
         name="discard_workspace",
@@ -94,6 +128,7 @@ def register_tools(mcp: FastMCP) -> None:
             "Permanently delete a worktree and its database record. "
             "All uncommitted changes inside the worktree are lost. "
             "The main repository and other workspaces are unaffected."
+            "\n\nSupports ``idempotency_key`` for safe retry."
         ),
         annotations=ToolAnnotations(
             readOnlyHint=False,
@@ -102,11 +137,15 @@ def register_tools(mcp: FastMCP) -> None:
             openWorldHint=False,
         ),
     )
-    async def discard_workspace(workspace_id: str) -> dict[str, object]:
+    async def discard_workspace(
+        workspace_id: str,
+        idempotency_key: str | None = None,
+    ) -> dict[str, object]:
         """Remove a workspace and its worktree from disk."""
-        log.info("discard_workspace workspace_id=%s", workspace_id)
-        try:
-            return workspace_manager.discard_workspace(workspace_id)
-        except ValueError as exc:
-            log.warning("discard_workspace failed: %s", exc)
-            return {"error": str(exc), "workspace_id": workspace_id}
+        log.info("discard_workspace workspace_id=%s idempotency_key=%s", workspace_id, idempotency_key)
+        return with_idempotency(
+            idempotency_key,
+            "discard_workspace",
+            {"workspace_id": workspace_id},
+            lambda: _do_discard_workspace(workspace_id),
+        )

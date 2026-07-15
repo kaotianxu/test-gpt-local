@@ -12,6 +12,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from app.config import get_project
+from app.services.envelope import error_result, ok_result
 from app.services.process_manager import ProcessManager
 from app.services.workspace_manager import get_workspace, list_workspaces
 from app.storage import database as db
@@ -51,20 +52,17 @@ def _parse_porcelain(output: str) -> list[dict[str, str]]:
 def _get_project_status(project_id: str) -> dict[str, Any]:
     project = get_project(project_id)
     if project is None:
-        return {"error": f"project not found: {project_id}", "project_id": project_id}
+        return error_result("PROJECT_NOT_FOUND", f"project not found: {project_id}")
     repository = Path(project["repository"]).expanduser().resolve()
     if not repository.is_dir():
-        return {
-            "error": f"main worktree path missing: {repository}",
-            "project_id": project_id,
-        }
+        return error_result("STALE_WORKSPACE", f"main worktree path missing: {repository}")
 
     head = _run_git(repository, ["rev-parse", "HEAD"])
     branch = _run_git(repository, ["branch", "--show-current"])
     status = _run_git(repository, ["status", "--porcelain=v1", "--untracked-files=all"])
     registered = _run_git(repository, ["worktree", "list", "--porcelain"])
     status_entries = _parse_porcelain(status.get("stdout", ""))
-    return {
+    return ok_result({
         "project_id": project_id,
         "main_worktree": str(repository),
         "main_head": head.get("stdout", "").strip() or None,
@@ -76,19 +74,16 @@ def _get_project_status(project_id: str) -> dict[str, Any]:
         "errors": [
             value["error"] for value in (head, branch, status, registered) if "error" in value
         ],
-    }
+    })
 
 
 def _get_workspace_report(workspace_id: str) -> dict[str, Any]:
     workspace = get_workspace(workspace_id)
     if workspace is None:
-        return {"error": f"workspace not found: {workspace_id}", "workspace_id": workspace_id}
+        return error_result("WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id)
     worktree = Path(workspace["worktree_path"])
     if not worktree.is_dir():
-        return {
-            "error": f"worktree path missing: {worktree}",
-            "workspace_id": workspace_id,
-        }
+        return error_result("STALE_WORKSPACE", f"worktree path missing: {worktree}", workspace_id=workspace_id)
 
     status = _run_git(worktree, ["status", "--porcelain=v1", "--untracked-files=all"])
     diff_check = _run_git(worktree, ["diff", "--check"])
@@ -156,31 +151,34 @@ def _get_workspace_report(workspace_id: str) -> dict[str, Any]:
     else:
         audit_state = workspace["status"]
 
-    return {
-        "workspace": workspace,
-        "audit_state": audit_state,
-        "git": {
-            "head": head.get("stdout", "").strip() or None,
-            "head_matches_base": head.get("stdout", "").strip() == workspace["base_commit"],
-            "working_tree_clean": not status_entries,
-            "changed_files": status_entries,
-            "diff_check_passed": diff_check.get("exit_code") == 0,
-            "diff_check_stdout": diff_check.get("stdout", ""),
-            "diff_check_stderr": diff_check.get("stderr", ""),
-            "commits_created": [
-                {"commit": line.split("\t", 1)[0], "subject": line.split("\t", 1)[-1]}
-                for line in commits.get("stdout", "").splitlines()
-                if line
-            ],
+    return ok_result(
+        {
+            "workspace": workspace,
+            "audit_state": audit_state,
+            "git": {
+                "head": head.get("stdout", "").strip() or None,
+                "head_matches_base": head.get("stdout", "").strip() == workspace["base_commit"],
+                "working_tree_clean": not status_entries,
+                "changed_files": status_entries,
+                "diff_check_passed": diff_check.get("exit_code") == 0,
+                "diff_check_stdout": diff_check.get("stdout", ""),
+                "diff_check_stderr": diff_check.get("stderr", ""),
+                "commits_created": [
+                    {"commit": line.split("\t", 1)[0], "subject": line.split("\t", 1)[-1]}
+                    for line in commits.get("stdout", "").splitlines()
+                    if line
+                ],
+            },
+            "checks": list(latest_checks.values()),
+            "required_checks": sorted(required_checks),
+            "missing_checks": missing_checks,
+            "processes": process_results,
+            "operations": db.list_operations(workspace_id),
+            "main_repo_unchanged_since_creation": main_unchanged,
+            "project_status": project_status,
         },
-        "checks": list(latest_checks.values()),
-        "required_checks": sorted(required_checks),
-        "missing_checks": missing_checks,
-        "processes": process_results,
-        "operations": db.list_operations(workspace_id),
-        "main_repo_unchanged_since_creation": main_unchanged,
-        "project_status": project_status,
-    }
+        workspace_id=workspace_id,
+    )
 
 
 def register_tools(mcp: FastMCP) -> None:

@@ -17,7 +17,12 @@ class TestListChecks:
     def test_returns_error_for_unknown_workspace(self) -> None:
         result = _list_checks("ws-nonexistent")
         assert "error" in result
-        assert "workspace not found" in result["error"]
+        # Envelope format: error is a dict with code/message keys.
+        error = result.get("error", {})
+        if isinstance(error, dict):
+            assert "workspace not found" in error.get("message", "")
+        else:
+            assert "workspace not found" in error
 
     def test_returns_error_for_invalid_format(self) -> None:
         result = _list_checks("not-a-valid-id")
@@ -33,7 +38,11 @@ class TestRunCheck:
     def test_returns_error_for_unknown_workspace(self) -> None:
         result = _run_check("ws-nonexistent", "unit_tests", wait=True)
         assert "error" in result
-        assert "workspace not found" in result["error"]
+        error = result.get("error", {})
+        if isinstance(error, dict):
+            assert "workspace not found" in error.get("message", "")
+        else:
+            assert "workspace not found" in error
 
     def test_returns_error_for_invalid_workspace_id(self) -> None:
         result = _run_check("not-valid", "unit_tests", wait=True)
