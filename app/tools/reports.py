@@ -62,28 +62,34 @@ def _get_project_status(project_id: str) -> dict[str, Any]:
     status = _run_git(repository, ["status", "--porcelain=v1", "--untracked-files=all"])
     registered = _run_git(repository, ["worktree", "list", "--porcelain"])
     status_entries = _parse_porcelain(status.get("stdout", ""))
-    return ok_result({
-        "project_id": project_id,
-        "main_worktree": str(repository),
-        "main_head": head.get("stdout", "").strip() or None,
-        "main_branch": branch.get("stdout", "").strip() or None,
-        "main_working_tree_clean": not status_entries,
-        "main_status": status_entries,
-        "git_worktree_list": registered.get("stdout", "").strip(),
-        "workspaces": list_workspaces(project_id),
-        "errors": [
-            value["error"] for value in (head, branch, status, registered) if "error" in value
-        ],
-    })
+    return ok_result(
+        {
+            "project_id": project_id,
+            "main_worktree": str(repository),
+            "main_head": head.get("stdout", "").strip() or None,
+            "main_branch": branch.get("stdout", "").strip() or None,
+            "main_working_tree_clean": not status_entries,
+            "main_status": status_entries,
+            "git_worktree_list": registered.get("stdout", "").strip(),
+            "workspaces": list_workspaces(project_id),
+            "errors": [
+                value["error"] for value in (head, branch, status, registered) if "error" in value
+            ],
+        }
+    )
 
 
 def _get_workspace_report(workspace_id: str) -> dict[str, Any]:
     workspace = get_workspace(workspace_id)
     if workspace is None:
-        return error_result("WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id)
+        return error_result(
+            "WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id
+        )
     worktree = Path(workspace["worktree_path"])
     if not worktree.is_dir():
-        return error_result("STALE_WORKSPACE", f"worktree path missing: {worktree}", workspace_id=workspace_id)
+        return error_result(
+            "STALE_WORKSPACE", f"worktree path missing: {worktree}", workspace_id=workspace_id
+        )
 
     status = _run_git(worktree, ["status", "--porcelain=v1", "--untracked-files=all"])
     diff_check = _run_git(worktree, ["diff", "--check"])

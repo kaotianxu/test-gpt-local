@@ -206,6 +206,7 @@ service:
   task_name: gpt-local-code-operator
   tunnel_enabled: true
   tunnel_profile: local-code-operator
+  tunnel_health_url: http://127.0.0.1:8080/readyz
   poll_interval_seconds: 2
   heartbeat_interval_seconds: 5
   startup_timeout_seconds: 120
@@ -650,4 +651,3 @@ If Phase 5 fails during implementation or deployment:
 
 Rollback must not require database migration reversal and must not modify any project
 worktree.
-

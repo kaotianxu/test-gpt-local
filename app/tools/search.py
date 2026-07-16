@@ -17,7 +17,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from app.services.envelope import error_result, ok_result
+from app.services.envelope import ok_result
 from app.services.path_guard import is_denied, resolve_within
 from app.services.workspace_manager import get_workspace
 
@@ -69,7 +69,9 @@ def _search(
 
     # Multi-query mode: run several searches and aggregate results.
     if queries and len(queries) > 1:
-        return _search_multi(workspace_id, worktree, queries, path, globs, context_lines, max_results)
+        return _search_multi(
+            workspace_id, worktree, queries, path, globs, context_lines, max_results
+        )
 
     try:
         q = _validate_query(query) if query else ""
@@ -242,12 +244,12 @@ def _search_multi(
         if not single.get("ok", True):
             errors.append(f"{q!r}: {single.get('error', {}).get('message', 'unknown error')}")
             continue
-        result = single.get("result", single)
-        for match in result.get("matches", []):
+        query_result = single.get("result", single)
+        for match in query_result.get("matches", []):
             match["query_group"] = q
             aggregated.append(match)
-        total_count += result.get("match_count", 0)
-        if result.get("truncated"):
+        total_count += query_result.get("match_count", 0)
+        if query_result.get("truncated"):
             truncated = True
 
     # Limit total results.

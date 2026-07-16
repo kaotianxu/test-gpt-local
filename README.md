@@ -45,6 +45,35 @@ pip install mcp[cli] pyyaml aiofile
 
 The server starts on `http://127.0.0.1:8765` with health check at `/healthz`.
 
+## Background Service (Recommended)
+
+Phase 5 can run the MCP server and Secure MCP Tunnel under one user-level background
+supervisor, so normal use does not require open terminal windows.
+
+```powershell
+# Diagnose the local runtime without exposing the tunnel key
+.\scripts\doctor.ps1
+
+# Install one hidden current-user Task Scheduler task and start it
+.\scripts\install-service.ps1
+
+# Inspect or control it
+.\scripts\status-service.ps1
+.\scripts\restart-service.ps1
+.\scripts\stop-service.ps1
+
+# Stop it and remove only the scheduled task
+.\scripts\uninstall-service.ps1
+```
+
+The installer uses the current user with limited privileges. It removes the legacy
+two-task layout, is safe to run again when upgrading, and preserves the database,
+configuration, logs, and worktrees on uninstall. `start-mcp.ps1` and
+`start-tunnel.ps1` remain available for foreground debugging.
+
+Runtime status is stored atomically in `data/service/status.json`. Rotating supervisor,
+MCP, and tunnel logs are written under `logs/`; runtime API-key values are redacted.
+
 ## Register a Project
 
 Edit `config/projects.yaml`:
@@ -131,8 +160,13 @@ tunnel-client init `
 ├── scripts/
 │   ├── start-mcp.ps1      # Start MCP server
 │   ├── start-tunnel.ps1   # Start tunnel-client
-│   ├── stop-all.ps1       # Stop all services
-│   └── install-scheduled-tasks.ps1
+│   ├── install-service.ps1
+│   ├── start-service.ps1
+│   ├── stop-service.ps1
+│   ├── restart-service.ps1
+│   ├── status-service.ps1
+│   ├── doctor.ps1
+│   └── uninstall-service.ps1
 ├── data/                  # SQLite database (gitignored)
 ├── logs/                  # Log files (gitignored)
 └── pyproject.toml

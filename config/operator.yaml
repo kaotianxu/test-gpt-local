@@ -33,3 +33,24 @@ files:
 logging:
   level: INFO
   retention_days: 14
+  max_file_bytes: 10485760
+  backup_count: 5
+
+service:
+  task_name: gpt-local-code-operator
+  tunnel_enabled: true
+  tunnel_profile: local-code-operator
+  tunnel_health_url: http://127.0.0.1:8080/readyz
+  poll_interval_seconds: 2
+  heartbeat_interval_seconds: 5
+  startup_timeout_seconds: 120
+  shutdown_timeout_seconds: 20
+  restart:
+    initial_delay_seconds: 2
+    multiplier: 2
+    max_delay_seconds: 60
+    stable_reset_seconds: 300
+  cleanup:
+    reconcile_on_start: true
+    report_expired_workspaces: true
+    auto_discard_clean_expired: false

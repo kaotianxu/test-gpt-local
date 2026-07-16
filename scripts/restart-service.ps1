@@ -1,8 +1,9 @@
 <#
 .SYNOPSIS
-    Compatibility wrapper that stops the owned Local Code Operator service.
+    Restarts the Local Code Operator background task.
 #>
 
 $ErrorActionPreference = "Stop"
 $ScriptRoot = Split-Path -Parent $PSCommandPath
 & (Join-Path $ScriptRoot "stop-service.ps1") -Force
+& (Join-Path $ScriptRoot "start-service.ps1")

@@ -60,10 +60,16 @@ def _run(worktree: Path, args: list[str], *, timeout: int = 30) -> dict[str, Any
 def _ensure_worktree(workspace_id: str) -> tuple[Path | None, dict[str, Any] | None]:
     record = get_workspace(workspace_id)
     if record is None:
-        return None, error_result("WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id)
+        return None, error_result(
+            "WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id
+        )
     worktree = Path(record["worktree_path"])
     if not worktree.exists():
-        return None, error_result("STALE_WORKSPACE", f"worktree path missing on disk: {worktree}", workspace_id=workspace_id)
+        return None, error_result(
+            "STALE_WORKSPACE",
+            f"worktree path missing on disk: {worktree}",
+            workspace_id=workspace_id,
+        )
     return worktree, None
 
 
@@ -106,13 +112,17 @@ def _git_diff(
     if paths:
         for p in paths:
             if not p or p.startswith("-"):
-                return error_result("INVALID_INPUT", f"invalid path argument: {p!r}", workspace_id=workspace_id)
+                return error_result(
+                    "INVALID_INPUT", f"invalid path argument: {p!r}", workspace_id=workspace_id
+                )
             try:
                 resolved = resolve_within(worktree, p, must_exist=False)
             except ValueError as exc:
                 return error_result("PATH_DENIED", str(exc), workspace_id=workspace_id)
             if is_denied(resolved, worktree):
-                return error_result("PATH_DENIED", "path is denied by policy", workspace_id=workspace_id)
+                return error_result(
+                    "PATH_DENIED", "path is denied by policy", workspace_id=workspace_id
+                )
             validated_paths.append(p)
     if validated_paths:
         args.extend(["--", *validated_paths])

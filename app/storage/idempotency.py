@@ -21,7 +21,7 @@ import hashlib
 import json
 import threading
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 # Import shared connection from the database module.
 from app.storage.database import _get_connection
@@ -75,7 +75,7 @@ def get_idempotent_result(
         return None
     if row["input_hash"] != input_hash:
         return {"_mismatch": True, "stored_hash": row["input_hash"]}
-    return json.loads(row["result_json"])
+    return cast(dict[str, Any], json.loads(row["result_json"]))
 
 
 def store_idempotent_result(

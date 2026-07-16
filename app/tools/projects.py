@@ -25,13 +25,15 @@ def register_tools(mcp: FastMCP) -> None:
             openWorldHint=False,
         ),
     )
-    async def ping() -> dict[str, str]:
+    async def ping() -> dict[str, object]:
         """Return a simple pong response to confirm connectivity."""
-        return ok_result({
-            "status": "ok",
-            "service": "gpt-local-code-operator",
-            "version": "0.2.0",
-        })
+        return ok_result(
+            {
+                "status": "ok",
+                "service": "gpt-local-code-operator",
+                "version": "0.2.0",
+            }
+        )
 
     @mcp.tool(
         name="list_projects",
@@ -43,13 +45,15 @@ def register_tools(mcp: FastMCP) -> None:
             openWorldHint=False,
         ),
     )
-    async def list_projects() -> list[dict[str, str]]:
+    async def list_projects() -> dict[str, object]:
         """Return a list of registered projects with their IDs and display names."""
         projects = load_projects_config()
-        return ok_result([
-            {
-                "project_id": pid,
-                "name": info.get("name", pid),
-            }
-            for pid, info in projects.items()
-        ])
+        return ok_result(
+            [
+                {
+                    "project_id": pid,
+                    "name": info.get("name", pid),
+                }
+                for pid, info in projects.items()
+            ]
+        )

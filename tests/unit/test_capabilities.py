@@ -1,6 +1,6 @@
 """Unit tests for the capabilities tool."""
 
-from app.tools.capabilities import _build_capabilities, SERVER_VERSION, SCHEMA_VERSION
+from app.tools.capabilities import SCHEMA_VERSION, SERVER_VERSION, _build_capabilities
 
 
 class TestCapabilities:

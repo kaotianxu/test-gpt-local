@@ -34,11 +34,17 @@ def _list_checks(workspace_id: str) -> dict[str, Any]:
     """Return the available checks for the workspace's project."""
     record = get_workspace(workspace_id)
     if record is None:
-        return error_result("WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id)
+        return error_result(
+            "WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id
+        )
 
     project = get_project(record["project_id"])
     if project is None:
-        return error_result("PROJECT_NOT_FOUND", f"project config not found: {record['project_id']}", workspace_id=workspace_id)
+        return error_result(
+            "PROJECT_NOT_FOUND",
+            f"project config not found: {record['project_id']}",
+            workspace_id=workspace_id,
+        )
 
     checks = project.get("checks", {})
     return ok_result(
@@ -73,14 +79,24 @@ def _run_check(
     # ---- 1. Look up workspace and project ----
     record = get_workspace(workspace_id)
     if record is None:
-        return error_result("WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id)
+        return error_result(
+            "WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id
+        )
     worktree = Path(record["worktree_path"])
     if not worktree.exists():
-        return error_result("STALE_WORKSPACE", f"worktree path missing on disk: {worktree}", workspace_id=workspace_id)
+        return error_result(
+            "STALE_WORKSPACE",
+            f"worktree path missing on disk: {worktree}",
+            workspace_id=workspace_id,
+        )
 
     project = get_project(record["project_id"])
     if project is None:
-        return error_result("PROJECT_NOT_FOUND", f"project config not found: {record['project_id']}", workspace_id=workspace_id)
+        return error_result(
+            "PROJECT_NOT_FOUND",
+            f"project config not found: {record['project_id']}",
+            workspace_id=workspace_id,
+        )
 
     # ---- 2. Look up check config ----
     checks = project.get("checks", {})
@@ -89,14 +105,20 @@ def _run_check(
         available = ", ".join(sorted(checks.keys()))
         return error_result(
             "CHECK_NOT_FOUND",
-            f"check_id {check_id!r} not found in project {record['project_id']!r}. Available checks: [{available}]",
+            f"check_id {check_id!r} not found in project "
+            f"{record['project_id']!r}. Available checks: [{available}]",
             workspace_id=workspace_id,
             extra={"check_id": check_id, "available_checks": sorted(checks.keys())},
         )
 
     script = check_cfg.get("script", "").strip()
     if not script:
-        return error_result("INVALID_INPUT", f"check {check_id!r} has an empty script", workspace_id=workspace_id, extra={"check_id": check_id})
+        return error_result(
+            "INVALID_INPUT",
+            f"check {check_id!r} has an empty script",
+            workspace_id=workspace_id,
+            extra={"check_id": check_id},
+        )
 
     timeout = check_cfg.get("timeout_seconds")
     if timeout is None:
@@ -112,7 +134,12 @@ def _run_check(
         isinstance(key, str) and isinstance(value, (str, int, float, bool))
         for key, value in configured_env.items()
     ):
-        return error_result("INVALID_INPUT", f"check {check_id!r} has an invalid env mapping", workspace_id=workspace_id, extra={"check_id": check_id})
+        return error_result(
+            "INVALID_INPUT",
+            f"check {check_id!r} has an invalid env mapping",
+            workspace_id=workspace_id,
+            extra={"check_id": check_id},
+        )
     check_env = {str(key): str(value) for key, value in configured_env.items()}
     check_env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
@@ -131,7 +158,9 @@ def _run_check(
             tool_name=f"run_check:{check_id}",
         )
     except RuntimeError as exc:
-        return error_result("RATE_LIMITED", str(exc), workspace_id=workspace_id, extra={"check_id": check_id})
+        return error_result(
+            "RATE_LIMITED", str(exc), workspace_id=workspace_id, extra={"check_id": check_id}
+        )
 
     process_id = spawn_result["process_id"]
 
@@ -272,7 +301,13 @@ def register_tools(mcp: FastMCP) -> None:
                 immediately with a ``process_id`` for later polling.
             idempotency_key: Optional key for idempotent retry.
         """
-        log.info("run_check workspace_id=%s check_id=%s wait=%s idempotency_key=%s", workspace_id, check_id, wait, idempotency_key)
+        log.info(
+            "run_check workspace_id=%s check_id=%s wait=%s idempotency_key=%s",
+            workspace_id,
+            check_id,
+            wait,
+            idempotency_key,
+        )
         return with_idempotency(
             idempotency_key,
             "run_check",

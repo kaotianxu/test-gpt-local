@@ -73,18 +73,30 @@ def _run_pwsh(
     # ---- 1. Look up workspace ----
     record = get_workspace(workspace_id)
     if record is None:
-        return error_result("WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id)
+        return error_result(
+            "WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id
+        )
     worktree = Path(record["worktree_path"])
     if not worktree.exists():
-        return error_result("STALE_WORKSPACE", f"worktree path missing on disk: {worktree}", workspace_id=workspace_id)
+        return error_result(
+            "STALE_WORKSPACE",
+            f"worktree path missing on disk: {worktree}",
+            workspace_id=workspace_id,
+        )
 
     project = get_project(record["project_id"])
     if project is None:
-        return error_result("PROJECT_NOT_FOUND", f"project config not found: {record['project_id']}", workspace_id=workspace_id)
+        return error_result(
+            "PROJECT_NOT_FOUND",
+            f"project config not found: {record['project_id']}",
+            workspace_id=workspace_id,
+        )
 
     # ---- 2. Validate inputs ----
     if not script or not script.strip():
-        return error_result("INVALID_INPUT", "script must be a non-empty string", workspace_id=workspace_id)
+        return error_result(
+            "INVALID_INPUT", "script must be a non-empty string", workspace_id=workspace_id
+        )
 
     timeout = min(
         max(timeout_seconds, 1),
@@ -97,7 +109,11 @@ def _run_pwsh(
         try:
             resolved = resolve_within(worktree, working_directory, must_exist=False)
             if is_denied(resolved, worktree):
-                return error_result("PATH_DENIED", "working_directory is denied by policy", workspace_id=workspace_id)
+                return error_result(
+                    "PATH_DENIED",
+                    "working_directory is denied by policy",
+                    workspace_id=workspace_id,
+                )
             cwd = str(resolved)
         except ValueError as exc:
             return error_result("PATH_DENIED", str(exc), workspace_id=workspace_id)
@@ -185,7 +201,11 @@ def _get_process_result(
                     result["git_status_after"] = _git_status(wt)
 
     if "error" in result:
-        return error_result("PROCESS_TIMEOUT" if "not found" in str(result.get("error", "")) else "INTERNAL_ERROR", str(result.get("error", "")), extra={"process_id": process_id})
+        return error_result(
+            "PROCESS_TIMEOUT" if "not found" in str(result.get("error", "")) else "INTERNAL_ERROR",
+            str(result.get("error", "")),
+            extra={"process_id": process_id},
+        )
     return ok_result(result, workspace_id=proc_record.get("workspace_id") if proc_record else None)
 
 
@@ -204,27 +224,41 @@ def _read_process_output(
         max_chars: Maximum number of characters to return.
     """
     if stream not in ("stdout", "stderr"):
-        return error_result("INVALID_INPUT", f"stream must be 'stdout' or 'stderr', got: {stream!r}")
+        return error_result(
+            "INVALID_INPUT", f"stream must be 'stdout' or 'stderr', got: {stream!r}"
+        )
 
     from app.storage import database as db
 
     record = db.get_process(process_id)
     if record is None:
-        return error_result("PROCESS_TIMEOUT" if "not found" in str(process_id) else "INVALID_INPUT", f"process not found: {process_id}", extra={"process_id": process_id})
+        return error_result(
+            "PROCESS_TIMEOUT" if "not found" in str(process_id) else "INVALID_INPUT",
+            f"process not found: {process_id}",
+            extra={"process_id": process_id},
+        )
 
     stream_key = "stdout_path" if stream == "stdout" else "stderr_path"
     file_path = record.get(stream_key)
     if not file_path:
-        return ok_result({"process_id": process_id, "stream": stream, "content": "", "total_chars": 0})
+        return ok_result(
+            {"process_id": process_id, "stream": stream, "content": "", "total_chars": 0}
+        )
 
     path = Path(file_path)
     if not path.exists():
-        return ok_result({"process_id": process_id, "stream": stream, "content": "", "total_chars": 0})
+        return ok_result(
+            {"process_id": process_id, "stream": stream, "content": "", "total_chars": 0}
+        )
 
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        return error_result("INTERNAL_ERROR", f"cannot read output file: {exc}", extra={"process_id": process_id, "stream": stream})
+        return error_result(
+            "INTERNAL_ERROR",
+            f"cannot read output file: {exc}",
+            extra={"process_id": process_id, "stream": stream},
+        )
 
     total = len(text)
     offset = max(0, min(offset, total - 1)) if total > 0 else 0
@@ -232,14 +266,16 @@ def _read_process_output(
     content = text[offset : offset + max_chars]
     truncated = (offset + max_chars) < total
 
-    return ok_result({
-        "process_id": process_id,
-        "stream": stream,
-        "offset": offset,
-        "content": content,
-        "total_chars": total,
-        "truncated": truncated,
-    })
+    return ok_result(
+        {
+            "process_id": process_id,
+            "stream": stream,
+            "offset": offset,
+            "content": content,
+            "total_chars": total,
+            "truncated": truncated,
+        }
+    )
 
 
 def _cancel_process(process_id: str) -> dict[str, Any]:
@@ -250,7 +286,9 @@ def _cancel_process(process_id: str) -> dict[str, Any]:
     pm = ProcessManager.get_instance()
     result = pm.cancel(process_id)
     if "error" in result:
-        return error_result("INVALID_INPUT", str(result.get("error", "")), extra={"process_id": process_id})
+        return error_result(
+            "INVALID_INPUT", str(result.get("error", "")), extra={"process_id": process_id}
+        )
     return ok_result(result)
 
 
@@ -417,7 +455,7 @@ def register_tools(mcp: FastMCP) -> None:
             "use as the ``process_id`` parameter.\n\n"
             "Parameters:\n"
             "- ``process_id``: the process ID or output_artifact_id.\n"
-            "- ``stream``: ``\"stdout\"`` (default) or ``\"stderr\"``.\n"
+            '- ``stream``: ``"stdout"`` (default) or ``"stderr"``.\n'
             "- ``offset``: character offset from the start of the file.\n"
             "- ``max_chars``: maximum characters to return (default 50000)."
         ),

@@ -5,6 +5,7 @@ Loads projects.yaml and operator.yaml from the config/ directory.
 
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlparse
 
 import yaml
 
@@ -64,8 +65,76 @@ def load_operator_config(path: Path | None = None) -> dict[str, Any]:
     log = cfg.setdefault("logging", {})
     log.setdefault("level", "INFO")
     log.setdefault("retention_days", 14)
+    log.setdefault("max_file_bytes", 10_485_760)
+    log.setdefault("backup_count", 5)
+
+    # --- background service defaults ---
+    service = cfg.setdefault("service", {})
+    service.setdefault("task_name", "gpt-local-code-operator")
+    service.setdefault("tunnel_enabled", True)
+    service.setdefault("tunnel_profile", "local-code-operator")
+    service.setdefault("tunnel_health_url", "http://127.0.0.1:8080/readyz")
+    service.setdefault("poll_interval_seconds", 2.0)
+    service.setdefault("heartbeat_interval_seconds", 5.0)
+    service.setdefault("startup_timeout_seconds", 120.0)
+    service.setdefault("shutdown_timeout_seconds", 20.0)
+    restart = service.setdefault("restart", {})
+    restart.setdefault("initial_delay_seconds", 2.0)
+    restart.setdefault("multiplier", 2.0)
+    restart.setdefault("max_delay_seconds", 60.0)
+    restart.setdefault("stable_reset_seconds", 300.0)
+    cleanup = service.setdefault("cleanup", {})
+    cleanup.setdefault("reconcile_on_start", True)
+    cleanup.setdefault("report_expired_workspaces", True)
+    cleanup.setdefault("auto_discard_clean_expired", False)
+
+    _validate_operator_config(cfg)
 
     return cfg
+
+
+def _validate_operator_config(cfg: dict[str, Any]) -> None:
+    """Reject unsafe or nonsensical operator settings."""
+    host = str(cfg["server"]["host"]).strip().lower()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("server.host must be a loopback address")
+    port = int(cfg["server"]["port"])
+    if not 1 <= port <= 65535:
+        raise ValueError("server.port must be between 1 and 65535")
+
+    proxy = cfg["proxy"]
+    if proxy.get("enabled", True):
+        parsed = urlparse(str(proxy.get("url", "")))
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or not parsed.port:
+            raise ValueError("proxy.url must be an HTTP(S) URL with an explicit port")
+
+    service = cfg["service"]
+    for key in (
+        "poll_interval_seconds",
+        "heartbeat_interval_seconds",
+        "startup_timeout_seconds",
+        "shutdown_timeout_seconds",
+    ):
+        if float(service[key]) <= 0:
+            raise ValueError(f"service.{key} must be positive")
+    if service.get("tunnel_enabled", True) and not str(service["tunnel_profile"]).strip():
+        raise ValueError("service.tunnel_profile is required when the tunnel is enabled")
+    tunnel_health = urlparse(str(service["tunnel_health_url"]))
+    if service.get("tunnel_enabled", True) and (
+        tunnel_health.scheme != "http"
+        or tunnel_health.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or tunnel_health.port is None
+    ):
+        raise ValueError("service.tunnel_health_url must be an explicit loopback HTTP URL")
+
+    restart = service["restart"]
+    for key in ("initial_delay_seconds", "multiplier", "max_delay_seconds"):
+        if float(restart[key]) <= 0:
+            raise ValueError(f"service.restart.{key} must be positive")
+    if float(restart["stable_reset_seconds"]) < 0:
+        raise ValueError("service.restart.stable_reset_seconds must not be negative")
+    if float(restart["max_delay_seconds"]) < float(restart["initial_delay_seconds"]):
+        raise ValueError("service.restart.max_delay_seconds must not be below the initial delay")
 
 
 def load_projects_config(path: Path | None = None) -> dict[str, Any]:
@@ -104,6 +173,12 @@ def get_logging_config() -> dict[str, Any]:
     """Return the logging configuration block."""
     cfg = load_operator_config()
     return cast(dict[str, Any], cfg["logging"])
+
+
+def get_service_config() -> dict[str, Any]:
+    """Return the background-service configuration block."""
+    cfg = load_operator_config()
+    return cast(dict[str, Any], cfg["service"])
 
 
 def get_process_config() -> dict[str, Any]:

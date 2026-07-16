@@ -433,29 +433,49 @@ def _apply_patch(
     # ---- 1. Look up workspace ----
     record = get_workspace(workspace_id)
     if record is None:
-        return error_result("WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id)
+        return error_result(
+            "WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id
+        )
     worktree = Path(record["worktree_path"])
     if not worktree.exists():
-        return error_result("STALE_WORKSPACE", f"worktree path missing on disk: {worktree}", workspace_id=workspace_id)
+        return error_result(
+            "STALE_WORKSPACE",
+            f"worktree path missing on disk: {worktree}",
+            workspace_id=workspace_id,
+        )
 
     # Basic input validation.
     if not patch or not patch.strip():
-        return error_result("INVALID_INPUT", "patch must be a non-empty string", workspace_id=workspace_id)
+        return error_result(
+            "INVALID_INPUT", "patch must be a non-empty string", workspace_id=workspace_id
+        )
     if len(patch) > _MAX_PATCH_CHARS:
-        return error_result("INVALID_INPUT", f"patch exceeds maximum size of {_MAX_PATCH_CHARS} characters", workspace_id=workspace_id)
+        return error_result(
+            "INVALID_INPUT",
+            f"patch exceeds maximum size of {_MAX_PATCH_CHARS} characters",
+            workspace_id=workspace_id,
+        )
 
     # ---- 1b. Validate expected_head if provided ----
     if expected_head is not None:
         head_proc = _run_git(worktree, ["git", "rev-parse", "HEAD"])
         if head_proc.get("exit_code", 1) != 0:
-            return error_result("INTERNAL_ERROR", "could not read workspace HEAD", workspace_id=workspace_id)
+            return error_result(
+                "INTERNAL_ERROR", "could not read workspace HEAD", workspace_id=workspace_id
+            )
         actual_head = head_proc.get("stdout", "").strip()
         if actual_head != expected_head:
             return error_result(
                 "FILE_CHANGED",
-                f"workspace HEAD changed since it was read: expected {expected_head[:12]}, actual {actual_head[:12]}",
+                "workspace HEAD changed since it was read: "
+                f"expected {expected_head[:12]}, actual {actual_head[:12]}",
                 workspace_id=workspace_id,
-                extra={"expected_head": expected_head, "actual_head": actual_head, "applied": False, "check_only": check_only},
+                extra={
+                    "expected_head": expected_head,
+                    "actual_head": actual_head,
+                    "applied": False,
+                    "check_only": check_only,
+                },
             )
 
     # ---- 2. Strip wrappers and normalise line endings ----
@@ -589,7 +609,12 @@ def _apply_patch(
                     "normalized_patch_preview": _diagnostic_preview(stripped, line_number),
                 }
             )
-        return error_result("PATCH_CONFLICT", "patch did not apply cleanly", workspace_id=workspace_id, extra=response)
+        return error_result(
+            "PATCH_CONFLICT",
+            "patch did not apply cleanly",
+            workspace_id=workspace_id,
+            extra=response,
+        )
 
     # If check_only, stop here.
     if check_only:
@@ -720,7 +745,9 @@ def _replace_text(
     """Perform an exact, concurrency-safe text replacement in one file."""
     record = get_workspace(workspace_id)
     if record is None:
-        return error_result("WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id)
+        return error_result(
+            "WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id
+        )
     worktree = Path(record["worktree_path"])
     try:
         target = resolve_within(worktree, path)
@@ -729,9 +756,13 @@ def _replace_text(
     if is_denied(target, worktree):
         return error_result("PATH_DENIED", "path is denied by policy", workspace_id=workspace_id)
     if not target.is_file():
-        return error_result("INVALID_INPUT", "path is not a regular file", workspace_id=workspace_id)
+        return error_result(
+            "INVALID_INPUT", "path is not a regular file", workspace_id=workspace_id
+        )
     if not old_text:
-        return error_result("INVALID_INPUT", "old_text must be non-empty", workspace_id=workspace_id)
+        return error_result(
+            "INVALID_INPUT", "old_text must be non-empty", workspace_id=workspace_id
+        )
 
     raw = target.read_bytes()
     actual_sha256 = hashlib.sha256(raw).hexdigest()
@@ -750,11 +781,18 @@ def _replace_text(
     try:
         content = raw.decode("utf-8")
     except UnicodeDecodeError:
-        return error_result("INVALID_INPUT", "file is not valid UTF-8 text", workspace_id=workspace_id)
+        return error_result(
+            "INVALID_INPUT", "file is not valid UTF-8 text", workspace_id=workspace_id
+        )
 
     occurrences = content.count(old_text)
     if occurrences == 0:
-        return error_result("PATCH_CONFLICT", "old_text was not found", workspace_id=workspace_id, extra={"error_type": "conflict", "path": path})
+        return error_result(
+            "PATCH_CONFLICT",
+            "old_text was not found",
+            workspace_id=workspace_id,
+            extra={"error_type": "conflict", "path": path},
+        )
     if occurrences > 1 and not replace_all:
         return error_result(
             "PATCH_CONFLICT",
@@ -880,7 +918,8 @@ def register_tools(mcp: FastMCP) -> None:
                 duplicate requests with the same key return the cached result.
         """
         log.info(
-            "apply_patch workspace_id=%s explanation=%s patch_len=%d check_only=%s idempotency_key=%s",
+            "apply_patch workspace_id=%s explanation=%s patch_len=%d "
+            "check_only=%s idempotency_key=%s",
             workspace_id,
             explanation,
             len(patch),

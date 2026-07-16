@@ -173,7 +173,7 @@ def _discover_project_manifest(repo: Path) -> dict[str, Any]:
         try:
             import json as _json
 
-            pkg = _json.loads((repo / "package.json").read_text(encoding="utf-8"))
+            _json.loads((repo / "package.json").read_text(encoding="utf-8"))
             if not manifest["package_manager"]:
                 manifest["package_manager"] = "npm"
         except (OSError, _json.JSONDecodeError):
@@ -201,9 +201,7 @@ def _discover_project_manifest(repo: Path) -> dict[str, Any]:
         manifest["project_config_files"].extend(str(f.relative_to(repo)) for f in sln_files[:3])
         manifest["languages"].append("csharp")
     if csproj_files:
-        manifest["project_config_files"].extend(
-            str(f.relative_to(repo)) for f in csproj_files[:3]
-        )
+        manifest["project_config_files"].extend(str(f.relative_to(repo)) for f in csproj_files[:3])
         if "csharp" not in manifest["languages"]:
             manifest["languages"].append("csharp")
         if not manifest["package_manager"]:
@@ -232,7 +230,9 @@ def _discover_project_manifest(repo: Path) -> dict[str, Any]:
     # Deduplicate languages.
     seen_langs: set[str] = set()
     manifest["languages"] = [
-        lang for lang in manifest["languages"] if lang not in seen_langs and not seen_langs.add(lang)  # type: ignore[func-returns-value]
+        lang
+        for lang in manifest["languages"]
+        if lang not in seen_langs and not seen_langs.add(lang)  # type: ignore[func-returns-value]
     ]
 
     return manifest

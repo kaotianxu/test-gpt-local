@@ -312,6 +312,26 @@ def list_processes(workspace_id: str) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def interrupt_incomplete_processes() -> int:
+    """Mark records orphaned by a previous service exit as interrupted."""
+    conn = _get_connection()
+    cursor = conn.execute(
+        """UPDATE processes
+           SET status = 'interrupted', completed_at = ?
+           WHERE status IN ('queued', 'running')""",
+        (_now_iso(),),
+    )
+    conn.commit()
+    return int(cursor.rowcount)
+
+
+def list_incomplete_processes() -> list[dict[str, Any]]:
+    """Return process records that have not reached a terminal state."""
+    conn = _get_connection()
+    rows = conn.execute("SELECT * FROM processes WHERE status IN ('queued', 'running')").fetchall()
+    return [dict(row) for row in rows]
+
+
 def update_process_status(
     process_id: str,
     status: str,

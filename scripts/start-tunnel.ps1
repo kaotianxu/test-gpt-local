@@ -14,10 +14,16 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 Set-Location $ProjectRoot
 
-$ProxyUrl = "http://127.0.0.1:7897"
-$ProxyHost = "127.0.0.1"
-$ProxyPort = 7897
-$McpHealthUrl = "http://127.0.0.1:8765/healthz"
+$PythonPath = (Get-Command python -ErrorAction Stop).Source
+$Runtime = (& $PythonPath -m app.service runtime-config) | ConvertFrom-Json
+$ProxyUrl = $Runtime.proxy.url
+$ProxyUri = [Uri]$ProxyUrl
+$ProxyHost = $ProxyUri.Host
+$ProxyPort = $ProxyUri.Port
+$McpHealthUrl = $Runtime.health_url
+$TunnelProfile = $Runtime.service.tunnel_profile
+$StartupTimeout = [int]$Runtime.service.startup_timeout_seconds
+$Attempts = [Math]::Max(1, [Math]::Ceiling($StartupTimeout / 2))
 
 # ---- Load runtime API key from .env ----
 $EnvFile = Join-Path $ProjectRoot ".env"
@@ -54,7 +60,7 @@ if (-not $env:CONTROL_PLANE_API_KEY) {
 # ---- Wait for local proxy ----
 Write-Host "[start-tunnel] Waiting for proxy at $ProxyUrl ..."
 $proxyReady = $false
-for ($i = 0; $i -lt 60; $i++) {
+for ($i = 0; $i -lt $Attempts; $i++) {
     if (Test-NetConnection -ComputerName $ProxyHost -Port $ProxyPort `
             -InformationLevel Quiet -WarningAction SilentlyContinue) {
         $proxyReady = $true
@@ -64,14 +70,14 @@ for ($i = 0; $i -lt 60; $i++) {
 }
 
 if (-not $proxyReady) {
-    throw "Proxy is not reachable at $ProxyUrl after 120 seconds."
+    throw "Proxy is not reachable at $ProxyUrl after $StartupTimeout seconds."
 }
 Write-Host "[start-tunnel] Proxy is ready."
 
 # ---- Wait for local MCP Server ----
 Write-Host "[start-tunnel] Waiting for MCP Server at $McpHealthUrl ..."
 $mcpReady = $false
-for ($i = 0; $i -lt 60; $i++) {
+for ($i = 0; $i -lt $Attempts; $i++) {
     try {
         $response = Invoke-WebRequest `
             -Uri $McpHealthUrl `
@@ -88,13 +94,13 @@ for ($i = 0; $i -lt 60; $i++) {
 }
 
 if (-not $mcpReady) {
-    throw "Local MCP Server is not ready at $McpHealthUrl after 120 seconds."
+    throw "Local MCP Server is not ready at $McpHealthUrl after $StartupTimeout seconds."
 }
 Write-Host "[start-tunnel] MCP Server is ready."
 
 # ---- Run diagnostic before connecting ----
 Write-Host "[start-tunnel] Running tunnel-client doctor ..."
-tunnel-client doctor --profile local-code-operator --explain
+tunnel-client doctor --profile $TunnelProfile --explain
 $doctorExitCode = $LASTEXITCODE
 if ($doctorExitCode -ne 0) {
     throw "tunnel-client doctor failed with exit code $doctorExitCode. Fix the reported checks before starting the tunnel."
@@ -102,4 +108,5 @@ if ($doctorExitCode -ne 0) {
 
 # ---- Start tunnel-client (long-running) ----
 Write-Host "[start-tunnel] Starting tunnel-client ..."
-tunnel-client run --profile local-code-operator
+tunnel-client run --profile $TunnelProfile
+exit $LASTEXITCODE

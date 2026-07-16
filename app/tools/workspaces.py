@@ -78,7 +78,12 @@ def register_tools(mcp: FastMCP) -> None:
             task_name: human-readable label stored in metadata.
             idempotency_key: Optional key for idempotent retry.
         """
-        log.info("create_workspace project_id=%s task_name=%s idempotency_key=%s", project_id, task_name, idempotency_key)
+        log.info(
+            "create_workspace project_id=%s task_name=%s idempotency_key=%s",
+            project_id,
+            task_name,
+            idempotency_key,
+        )
         return with_idempotency(
             idempotency_key,
             "create_workspace",
@@ -118,7 +123,7 @@ def register_tools(mcp: FastMCP) -> None:
     )
     async def list_workspaces(
         project_id: str | None = None,
-    ) -> list[dict[str, object]]:
+    ) -> dict[str, object]:
         """Return the workspace list, optionally filtered by project."""
         return ok_result(workspace_manager.list_workspaces(project_id))
 
@@ -142,7 +147,9 @@ def register_tools(mcp: FastMCP) -> None:
         idempotency_key: str | None = None,
     ) -> dict[str, object]:
         """Remove a workspace and its worktree from disk."""
-        log.info("discard_workspace workspace_id=%s idempotency_key=%s", workspace_id, idempotency_key)
+        log.info(
+            "discard_workspace workspace_id=%s idempotency_key=%s", workspace_id, idempotency_key
+        )
         return with_idempotency(
             idempotency_key,
             "discard_workspace",

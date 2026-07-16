@@ -84,7 +84,9 @@ def _build_tree(
 def _repo_map(workspace_id: str, path: str = "") -> dict[str, Any]:
     record = get_workspace(workspace_id)
     if record is None:
-        return error_result("WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id)
+        return error_result(
+            "WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id
+        )
     worktree = Path(record["worktree_path"])
 
     if path.strip() == "":

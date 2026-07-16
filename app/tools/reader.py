@@ -112,11 +112,15 @@ def _read_files(
 ) -> dict[str, Any]:
     record = get_workspace(workspace_id)
     if record is None:
-        return error_result("WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id)
+        return error_result(
+            "WORKSPACE_NOT_FOUND", f"workspace not found: {workspace_id}", workspace_id=workspace_id
+        )
     worktree = Path(record["worktree_path"])
 
     if not items:
-        return error_result("INVALID_INPUT", "items must be a non-empty list", workspace_id=workspace_id)
+        return error_result(
+            "INVALID_INPUT", "items must be a non-empty list", workspace_id=workspace_id
+        )
 
     cfg = get_files_config()
     max_chars = int(cfg.get("max_read_chars", _DEFAULT_MAX_CHARS))

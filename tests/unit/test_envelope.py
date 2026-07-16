@@ -1,7 +1,8 @@
 """Unit tests for the response envelope helper."""
 
-from app.services.envelope import ok_result, error_result, generate_request_id, elapsed_ms
 import time
+
+from app.services.envelope import elapsed_ms, error_result, generate_request_id, ok_result
 
 
 class TestOkResult:
@@ -52,7 +53,9 @@ class TestErrorResult:
         assert result["error"]["suggested_next_tool"] == "read_files"
 
     def test_error_with_extra_fields(self) -> None:
-        result = error_result("FILE_CHANGED", "hash mismatch", extra={"expected": "abc", "actual": "def"})
+        result = error_result(
+            "FILE_CHANGED", "hash mismatch", extra={"expected": "abc", "actual": "def"}
+        )
         assert result["error"]["expected"] == "abc"
         assert result["error"]["actual"] == "def"
 
