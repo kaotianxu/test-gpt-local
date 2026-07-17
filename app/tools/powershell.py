@@ -13,6 +13,7 @@ Tools
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import subprocess
@@ -183,6 +184,9 @@ def _get_process_result(
     tail = min(max(tail_chars, 1), max_tail)
 
     result = pm.get_result(process_id, tail_chars=tail)
+    from app.storage import database as db
+
+    proc_record = db.get_process(process_id)
 
     # If the process has finished, attach git_status_after.
     terminal = {"passed", "failed", "timed_out", "cancelled"}
@@ -190,9 +194,6 @@ def _get_process_result(
         # We need to find the workspace for this process to run git status.
         # The process record has workspace_id but not the worktree path.
         # We'll look it up from the DB record.
-        from app.storage import database as db
-
-        proc_record = db.get_process(process_id)
         if proc_record and proc_record.get("workspace_id"):
             ws = get_workspace(proc_record["workspace_id"])
             if ws:
@@ -202,11 +203,17 @@ def _get_process_result(
 
     if "error" in result:
         return error_result(
-            "PROCESS_TIMEOUT" if "not found" in str(result.get("error", "")) else "INTERNAL_ERROR",
+            "PROCESS_NOT_FOUND"
+            if "not found" in str(result.get("error", "")).lower()
+            else "INTERNAL_ERROR",
             str(result.get("error", "")),
             extra={"process_id": process_id},
         )
-    return ok_result(result, workspace_id=proc_record.get("workspace_id") if proc_record else None)
+    return ok_result(
+        result,
+        workspace_id=proc_record.get("workspace_id") if proc_record else None,
+        truncated=bool(result.get("truncated")),
+    )
 
 
 def _read_process_output(
@@ -233,7 +240,7 @@ def _read_process_output(
     record = db.get_process(process_id)
     if record is None:
         return error_result(
-            "PROCESS_TIMEOUT" if "not found" in str(process_id) else "INVALID_INPUT",
+            "PROCESS_NOT_FOUND",
             f"process not found: {process_id}",
             extra={"process_id": process_id},
         )
@@ -242,13 +249,15 @@ def _read_process_output(
     file_path = record.get(stream_key)
     if not file_path:
         return ok_result(
-            {"process_id": process_id, "stream": stream, "content": "", "total_chars": 0}
+            {"process_id": process_id, "stream": stream, "content": "", "total_chars": 0},
+            workspace_id=record.get("workspace_id"),
         )
 
     path = Path(file_path)
     if not path.exists():
         return ok_result(
-            {"process_id": process_id, "stream": stream, "content": "", "total_chars": 0}
+            {"process_id": process_id, "stream": stream, "content": "", "total_chars": 0},
+            workspace_id=record.get("workspace_id"),
         )
 
     try:
@@ -274,7 +283,10 @@ def _read_process_output(
             "content": content,
             "total_chars": total,
             "truncated": truncated,
-        }
+        },
+        workspace_id=record.get("workspace_id"),
+        truncated=truncated,
+        next_cursor=str(offset + len(content)) if truncated else None,
     )
 
 
@@ -287,9 +299,16 @@ def _cancel_process(process_id: str) -> dict[str, Any]:
     result = pm.cancel(process_id)
     if "error" in result:
         return error_result(
-            "INVALID_INPUT", str(result.get("error", "")), extra={"process_id": process_id}
+            "PROCESS_NOT_FOUND"
+            if "not found" in str(result.get("error", "")).lower()
+            else "INVALID_INPUT",
+            str(result.get("error", "")),
+            extra={"process_id": process_id},
         )
-    return ok_result(result)
+    from app.storage import database as db
+
+    record = db.get_process(process_id)
+    return ok_result(result, workspace_id=record.get("workspace_id") if record else None)
 
 
 # ── Tool registration ──────────────────────────────────────────────────
@@ -362,7 +381,8 @@ def register_tools(mcp: FastMCP) -> None:
             len(script),
             idempotency_key,
         )
-        return with_idempotency(
+        return await asyncio.to_thread(
+            with_idempotency,
             idempotency_key,
             "run_pwsh",
             {

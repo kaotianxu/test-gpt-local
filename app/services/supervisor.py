@@ -43,6 +43,7 @@ class ChildRuntime:
     process: subprocess.Popen[str] | None = None
     state: str = "stopped"
     started_monotonic: float | None = None
+    unhealthy_since_monotonic: float | None = None
     next_start_monotonic: float = 0.0
     consecutive_failures: int = 0
     restart_count: int = 0
@@ -160,11 +161,16 @@ class Supervisor:
             if mcp_healthy:
                 self.mcp.state = "healthy"
                 self.mcp.last_error = None
+                self.mcp.unhealthy_since_monotonic = None
                 self._reset_failures_if_stable(self.mcp, now)
             else:
                 self.mcp.state = "starting"
-                started = self.mcp.started_monotonic or now
-                if now - started >= float(self.service_cfg["startup_timeout_seconds"]):
+                if self.mcp.unhealthy_since_monotonic is None:
+                    self.mcp.unhealthy_since_monotonic = now
+                unhealthy_since = self.mcp.unhealthy_since_monotonic
+                if now - unhealthy_since >= float(
+                    self.service_cfg["startup_timeout_seconds"]
+                ):
                     self.mcp.last_error = "health check did not become ready before timeout"
                     self.log.error("event=mcp_startup_timeout pid=%s", self.mcp.pid)
                     self._stop_child(self.mcp)
@@ -196,11 +202,16 @@ class Supervisor:
             if self._tunnel_is_healthy():
                 self.tunnel.state = "healthy"
                 self.tunnel.last_error = None
+                self.tunnel.unhealthy_since_monotonic = None
                 self._reset_failures_if_stable(self.tunnel, now)
             else:
                 self.tunnel.state = "starting"
-                started = self.tunnel.started_monotonic or now
-                if now - started >= float(self.service_cfg["startup_timeout_seconds"]):
+                if self.tunnel.unhealthy_since_monotonic is None:
+                    self.tunnel.unhealthy_since_monotonic = now
+                unhealthy_since = self.tunnel.unhealthy_since_monotonic
+                if now - unhealthy_since >= float(
+                    self.service_cfg["startup_timeout_seconds"]
+                ):
                     self.tunnel.last_error = "readiness check did not pass before timeout"
                     self.log.error("event=tunnel_startup_timeout pid=%s", self.tunnel.pid)
                     self._stop_child(self.tunnel)
@@ -241,6 +252,7 @@ class Supervisor:
 
         child.process = process
         child.started_monotonic = self.clock()
+        child.unhealthy_since_monotonic = child.started_monotonic
         child.start_count += 1
         if child.start_count > 1:
             child.restart_count += 1
@@ -299,6 +311,7 @@ class Supervisor:
         child.last_error = f"exited with code {exit_code}"
         child.process = None
         child.creation_identity = None
+        child.unhealthy_since_monotonic = None
         self.log.warning("event=child_exited child=%s exit_code=%s", child.name, exit_code)
         if not self._shutdown:
             self._schedule_restart(child, now)
@@ -341,6 +354,7 @@ class Supervisor:
         child.last_exit_code = process.poll()
         child.process = None
         child.creation_identity = None
+        child.unhealthy_since_monotonic = None
         self.log.info("event=child_stopped child=%s", child.name)
 
     def _shutdown_children(self) -> None:

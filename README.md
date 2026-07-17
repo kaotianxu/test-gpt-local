@@ -137,8 +137,22 @@ tunnel-client init `
 | `run_check` | Run configured checks |
 | `get_process_result` | Get async process output |
 | `cancel_process` | Terminate process tree |
+| `read_process_output` | Page through captured stdout or stderr |
+| `run_command` | Run batch or interactive PTY commands |
+| `write_process_input` | Send ordered input to an interactive process |
+| `send_process_signal` | Send interrupt, EOF, or terminate |
+| `resize_terminal` | Resize an active ConPTY terminal |
+| `view_image` | Validate and return a workspace image |
+| `list_artifacts` | Discover and list workspace artifacts |
+| `read_artifact` | Read a text artifact with pagination |
+| `view_artifact` | View a registered image artifact |
+| `get_workspace_plan` | Read the persistent workspace plan |
+| `update_workspace_plan` | Create or replace a revisioned plan |
+| `update_workspace_plan_step` | Update one step and attach evidence |
 | `git_status` | Git status |
 | `git_diff` | Git diff |
+| `get_workspace_report` | Unified Git, process, artifact, plan, and readiness report |
+| `get_capabilities` | Feature flags and operational limits |
 
 ## Configuration
 
@@ -190,6 +204,8 @@ permissions. Only register projects you trust.
 - No automatic commit, merge, push, or deploy
 - Commands have timeouts and process tree termination
 - Each task uses an isolated Git worktree
+- Artifact paths are restricted to their workspace or the controlled process-output store
+- Audit records store redacted summaries, never raw process input or environment values
 
 ## License
 

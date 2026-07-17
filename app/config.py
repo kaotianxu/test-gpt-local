@@ -61,6 +61,12 @@ def load_operator_config(path: Path | None = None) -> dict[str, Any]:
     files.setdefault("max_read_chars", 100000)
     files.setdefault("deny_paths", [".git", ".env", ".env.local"])
 
+    # --- artifact defaults ---
+    artifacts = cfg.setdefault("artifacts", {})
+    artifacts.setdefault("retention_days", 7)
+    artifacts.setdefault("cleanup_on_workspace_discard", True)
+    artifacts.setdefault("max_discovery_files", 100)
+
     # --- logging defaults ---
     log = cfg.setdefault("logging", {})
     log.setdefault("level", "INFO")
@@ -191,3 +197,21 @@ def get_files_config() -> dict[str, Any]:
     """Return the file access configuration block."""
     cfg = load_operator_config()
     return cast(dict[str, Any], cfg["files"])
+
+
+def get_image_config() -> dict[str, Any]:
+    """Return the image configuration block with defaults."""
+    cfg = load_operator_config()
+    img = cfg.setdefault("image", {})
+    img.setdefault("max_file_size_bytes", 20_971_520)
+    img.setdefault("max_pixels", 50_000_000)
+    img.setdefault("max_dimension", 10_000)
+    img.setdefault("max_dimension_high", 2048)
+    img.setdefault("supported_formats", ["image/png", "image/jpeg", "image/webp"])
+    img.setdefault("deny_svg", True)
+    return cast(dict[str, Any], img)
+
+
+def get_artifact_config() -> dict[str, Any]:
+    """Return artifact discovery and cleanup settings."""
+    return cast(dict[str, Any], load_operator_config()["artifacts"])

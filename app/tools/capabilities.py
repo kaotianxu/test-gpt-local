@@ -9,7 +9,12 @@ from __future__ import annotations
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from app.config import get_files_config, get_process_config, load_operator_config
+from app.config import (
+    get_artifact_config,
+    get_files_config,
+    get_process_config,
+    load_operator_config,
+)
 
 SERVER_VERSION = "0.2.0"
 SCHEMA_VERSION = "1.0.0"
@@ -19,6 +24,7 @@ def _build_capabilities() -> dict[str, object]:
     """Return the server capabilities dictionary."""
     proc_cfg = get_process_config()
     files_cfg = get_files_config()
+    artifact_cfg = get_artifact_config()
     ws_cfg = load_operator_config().get("workspace", {})
 
     caps: dict[str, bool] = {
@@ -31,6 +37,14 @@ def _build_capabilities() -> dict[str, object]:
         "supports_diff_stat_only": True,
         "supports_project_manifest": True,
         "supports_read_process_output": True,
+        "supports_view_image": True,
+        "supports_pty": True,
+        "supports_process_input": True,
+        "supports_process_signal": True,
+        "supports_terminal_resize": True,
+        "supports_artifact_registry": True,
+        "supports_artifact_discovery": True,
+        "supports_workspace_plan": True,
     }
 
     return {
@@ -44,6 +58,9 @@ def _build_capabilities() -> dict[str, object]:
             "max_timeout_seconds": int(proc_cfg.get("max_timeout_seconds", 3600)),
             "max_active_workspaces_per_project": int(ws_cfg.get("max_active_per_project", 8)),
             "max_concurrent_jobs": int(proc_cfg.get("max_running_jobs", 3)),
+            "max_artifact_discovery_files": int(
+                artifact_cfg.get("max_discovery_files", 100)
+            ),
         },
     }
 

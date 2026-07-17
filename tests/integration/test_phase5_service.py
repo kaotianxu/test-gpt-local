@@ -159,6 +159,40 @@ def test_mcp_only_mode_becomes_healthy_without_tunnel(tmp_path: Path) -> None:
     assert not thread.is_alive()
 
 
+def test_transient_health_failure_after_stability_does_not_restart_mcp(
+    tmp_path: Path,
+) -> None:
+    supervisor = _make_supervisor(tmp_path)
+    supervisor.service_cfg["tunnel_enabled"] = False
+    thread = threading.Thread(target=supervisor.run)
+    thread.start()
+    store = ServiceStateStore(tmp_path / "data" / "service")
+
+    _wait_for(lambda: (store.read_status() or {}).get("state") == "healthy")
+    first_pid = supervisor.mcp.pid
+    assert first_pid is not None
+
+    original_health = supervisor._mcp_is_healthy
+    failed_once = threading.Event()
+
+    def transient_health() -> bool:
+        if not failed_once.is_set():
+            failed_once.set()
+            return False
+        return original_health()
+
+    supervisor._mcp_is_healthy = transient_health  # type: ignore[method-assign]
+    _wait_for(failed_once.is_set)
+    _wait_for(lambda: supervisor.mcp.state == "healthy")
+
+    assert supervisor.mcp.pid == first_pid
+    assert supervisor.mcp.restart_count == 0
+
+    store.request_stop(0)
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+
+
 def test_foreign_healthy_listener_never_unlocks_tunnel(tmp_path: Path) -> None:
     supervisor = _make_supervisor(tmp_path)
     port = int(supervisor.server_cfg["port"])

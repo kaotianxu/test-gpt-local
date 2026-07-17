@@ -1,10 +1,12 @@
 """Unit coverage for Phase 5 service state, configuration, and logging."""
 
+import asyncio
 import logging
 import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -26,7 +28,7 @@ from app.services.supervisor import (
     _worktree_is_clean,
 )
 from app.storage import database as db
-from app.tools import projects
+from app.tools import powershell, projects
 
 
 def test_service_configuration_defaults_and_validation(tmp_path: Path) -> None:
@@ -188,6 +190,31 @@ async def test_ping_output_schema_accepts_structured_envelope() -> None:
     projects.register_tools(mcp)
     ping = next(tool for tool in await mcp.list_tools() if tool.name == "ping")
     assert ping.outputSchema["additionalProperties"] is True
+
+
+@pytest.mark.asyncio
+async def test_waiting_powershell_tool_does_not_block_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def slow_run(**_kwargs: object) -> dict[str, object]:
+        time.sleep(0.2)
+        return {"ok": True}
+
+    monkeypatch.setattr(powershell, "_run_pwsh", slow_run)
+    mcp = FastMCP("nonblocking-tool-test")
+    powershell.register_tools(mcp)
+
+    call = asyncio.create_task(
+        mcp._tool_manager.call_tool(
+            "run_pwsh",
+            {"workspace_id": "ws-test", "script": "Start-Sleep 1"},
+        )
+    )
+    started = time.monotonic()
+    await asyncio.sleep(0.03)
+
+    assert time.monotonic() - started < 0.15
+    await call
 
 
 def test_dirty_worktree_is_never_cleanup_eligible(tmp_path: Path) -> None:

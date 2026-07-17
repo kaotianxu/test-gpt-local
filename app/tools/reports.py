@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -12,12 +13,67 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from app.config import get_project
+from app.services import artifact_registry, workspace_plan
 from app.services.envelope import error_result, ok_result
 from app.services.process_manager import ProcessManager
 from app.services.workspace_manager import get_workspace, list_workspaces
 from app.storage import database as db
 
 _MAX_OUTPUT = 200_000
+_TEST_STEP_RE = re.compile(
+    r"\b(test|tests|testing|check|checks|pytest|playwright)\b|测试|验收", re.I
+)
+
+
+def _plan_summary(plan: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return report-friendly counts while retaining full step evidence."""
+    if plan is None:
+        return None
+    steps = plan.get("steps", [])
+    counts = {
+        status: sum(1 for step in steps if step.get("status") == status)
+        for status in ("completed", "in_progress", "pending", "blocked", "cancelled")
+    }
+    evidence_statuses = [
+        status
+        for step in steps
+        for status in step.get("evidence_status", [])
+    ]
+    return {
+        **plan,
+        **counts,
+        "evidence": {
+            "count": sum(len(step.get("evidence", [])) for step in steps),
+            "available": sum(item.get("status") == "available" for item in evidence_statuses),
+            "stale": sum(item.get("status") == "stale" for item in evidence_statuses),
+            "invalid": sum(
+                item.get("status") in {"invalid", "cross_workspace", "unresolved"}
+                for item in evidence_statuses
+            ),
+        },
+    }
+
+
+def _test_step_has_successful_evidence(workspace_id: str, step: dict[str, Any]) -> bool:
+    """Require completed test/check steps to cite a successful run."""
+    for item in step.get("evidence", []):
+        if not isinstance(item, dict):
+            continue
+        evidence_type = item.get("type")
+        evidence_id = item.get("id")
+        if evidence_type == "process_id" and isinstance(evidence_id, str):
+            process = db.get_process(evidence_id)
+            if process and process.get("workspace_id") == workspace_id:
+                if process.get("status") == "passed":
+                    return True
+        elif evidence_type == "check_id" and isinstance(evidence_id, str):
+            if any(
+                process.get("tool_name") == f"run_check:{evidence_id}"
+                and process.get("status") == "passed"
+                for process in db.list_processes(workspace_id)
+            ):
+                return True
+    return False
 
 
 def _run_git(path: Path, args: list[str]) -> dict[str, Any]:
@@ -123,17 +179,19 @@ def _get_workspace_report(workspace_id: str) -> dict[str, Any]:
             )
 
     project_status = _get_project_status(workspace["project_id"])
+    project_status_result = project_status.get("result", {}) if project_status.get("ok") else {}
     baseline_head = workspace.get("main_head_at_creation")
     baseline_status_sha256 = workspace.get("main_status_sha256_at_creation")
     current_main_status = "\n".join(
-        f"{entry['status_code']} {entry['path']}" for entry in project_status.get("main_status", [])
+        f"{entry['status_code']} {entry['path']}"
+        for entry in project_status_result.get("main_status", [])
     )
     if current_main_status:
         current_main_status += "\n"
     main_unchanged: bool | None = None
     if baseline_head is not None and baseline_status_sha256 is not None:
         main_unchanged = (
-            project_status.get("main_head") == baseline_head
+            project_status_result.get("main_head") == baseline_head
             and hashlib.sha256(current_main_status.encode("utf-8")).hexdigest()
             == baseline_status_sha256
         )
@@ -157,6 +215,44 @@ def _get_workspace_report(workspace_id: str) -> dict[str, Any]:
     else:
         audit_state = workspace["status"]
 
+    active_processes = [
+        process
+        for process in process_results
+        if process.get("status") in {"queued", "running"}
+    ]
+    raw_plan = workspace_plan.get_plan(workspace_id).get("plan")
+    plan = _plan_summary(raw_plan)
+    acceptance_blockers: list[str] = []
+    if active_processes:
+        acceptance_blockers.append("active_processes")
+    if diff_check.get("exit_code") != 0:
+        acceptance_blockers.append("git_diff_check_failed")
+    if main_unchanged is False:
+        acceptance_blockers.append("main_repository_changed")
+    if missing_checks:
+        acceptance_blockers.append("required_checks_missing")
+    if any(state != "passed" for state in check_statuses):
+        acceptance_blockers.append("checks_not_passed")
+    if raw_plan is None:
+        acceptance_blockers.append("plan_missing")
+    else:
+        unfinished = [
+            step
+            for step in raw_plan.get("steps", [])
+            if step.get("status") != "completed"
+        ]
+        if unfinished:
+            acceptance_blockers.append("plan_incomplete")
+        missing_test_evidence = [
+            step.get("id")
+            for step in raw_plan.get("steps", [])
+            if step.get("status") == "completed"
+            and _TEST_STEP_RE.search(str(step.get("text", "")))
+            and not _test_step_has_successful_evidence(workspace_id, step)
+        ]
+        if missing_test_evidence:
+            acceptance_blockers.append("test_step_missing_successful_evidence")
+
     return ok_result(
         {
             "workspace": workspace,
@@ -179,7 +275,12 @@ def _get_workspace_report(workspace_id: str) -> dict[str, Any]:
             "required_checks": sorted(required_checks),
             "missing_checks": missing_checks,
             "processes": process_results,
+            "active_processes": active_processes,
             "operations": db.list_operations(workspace_id),
+            "artifacts": artifact_registry.count_artifacts(workspace_id),
+            "plan": plan,
+            "acceptance_ready": not acceptance_blockers,
+            "acceptance_blockers": acceptance_blockers,
             "main_repo_unchanged_since_creation": main_unchanged,
             "project_status": project_status,
         },

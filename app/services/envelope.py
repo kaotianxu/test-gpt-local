@@ -135,3 +135,42 @@ def error_result(
 def elapsed_ms(start: float) -> int:
     """Return the elapsed time in milliseconds since *start* (from ``time.monotonic()``)."""
     return int((time.monotonic() - start) * 1000)
+
+
+def audit_event(
+    *,
+    tool_name: str,
+    request_id: str,
+    workspace_id: str | None,
+    input_summary: str,
+    success: bool,
+    duration_ms: int,
+    error_code: str | None = None,
+    result_status: str | None = None,
+) -> None:
+    """Write a redacted audit event without changing the tool result.
+
+    Tools pass summaries such as ``text_len=12`` rather than raw user input.
+    Audit failures are intentionally swallowed so a logging/storage hiccup
+    cannot crash the MCP server or turn a successful operation into an error.
+    """
+    try:
+        from app.storage import database as db
+
+        db.log_operation(
+            operation_id="op_" + secrets.token_hex(8),
+            tool_name=tool_name,
+            summary=input_summary[:500],
+            workspace_id=workspace_id,
+            success=success,
+            request_id=request_id,
+            actor="mcp",
+            input_summary=input_summary[:500],
+            result_status=result_status or ("success" if success else "error"),
+            duration_ms=duration_ms,
+            error_code=error_code,
+        )
+    except Exception:
+        # Audit must be best-effort and never expose a database exception to
+        # the caller of an otherwise valid tool operation.
+        return

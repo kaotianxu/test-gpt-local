@@ -15,18 +15,22 @@ from app.config import (
     get_server_bind,
     load_operator_config,
 )
-from app.storage.database import init_db
+from app.storage import database as db
 from app.tools import (
+    artifacts,
     capabilities,
     checks,
     git_tools,
     patcher,
+    plans,
     powershell,
     projects,
+    pty_process,
     reader,
     repo_map,
     reports,
     search,
+    view_image,
     workspaces,
 )
 
@@ -56,7 +60,10 @@ def create_app() -> FastMCP:
     # ---- Initialise state store ----
     data_dir = Path(__file__).resolve().parent.parent / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
-    init_db(data_dir / "operator.db")
+    db.init_db(data_dir / "operator.db")
+    orphaned = db.interrupt_incomplete_processes()
+    if orphaned:
+        log.warning("marked %d orphaned process record(s) as interrupted", orphaned)
 
     # ---- Configure logging ----
     log_cfg = get_logging_config()
@@ -144,6 +151,18 @@ def create_app() -> FastMCP:
     checks.register_tools(mcp)
     # (run_check, list_checks)
     # here as they are implemented.
+
+    # Phase 5: view_image.
+    view_image.register_tools(mcp)
+
+    # Phase 5: PTY / interactive process.
+    pty_process.register_tools(mcp)
+
+    # Phase 5: artifact registry.
+    artifacts.register_tools(mcp)
+
+    # Phase 5: workspace plan.
+    plans.register_tools(mcp)
 
     return mcp
 

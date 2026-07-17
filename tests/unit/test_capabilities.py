@@ -23,6 +23,13 @@ class TestCapabilities:
         assert caps["supports_diff_stat_only"] is True
         assert caps["supports_project_manifest"] is True
         assert caps["supports_read_process_output"] is True
+        assert caps["supports_view_image"] is True
+        assert caps["supports_pty"] is True
+        assert caps["supports_process_input"] is True
+        assert caps["supports_process_signal"] is True
+        assert caps["supports_artifact_registry"] is True
+        assert caps["supports_artifact_discovery"] is True
+        assert caps["supports_workspace_plan"] is True
 
     def test_limits_are_positive_integers(self) -> None:
         limits = _build_capabilities()["limits"]

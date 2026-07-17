@@ -394,6 +394,7 @@ def discard_workspace(workspace_id: str) -> dict[str, Any]:
 
     database_record_removed = False
     if not path_exists_after and git_registration_removed:
+        ProcessManager.get_instance().delete_outputs_for_workspace(workspace_id)
         db.delete_workspace(workspace_id)
         database_record_removed = db.get_workspace(workspace_id) is None
     elif git_error is None:

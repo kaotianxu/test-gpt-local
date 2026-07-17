@@ -30,6 +30,22 @@ files:
     - .env
     - .env.local
 
+image:
+  max_file_size_bytes: 20971520
+  max_pixels: 50000000
+  max_dimension: 10000
+  max_dimension_high: 2048
+  supported_formats:
+    - image/png
+    - image/jpeg
+    - image/webp
+  deny_svg: true
+
+artifacts:
+  retention_days: 7
+  cleanup_on_workspace_discard: true
+  max_discovery_files: 100
+
 logging:
   level: INFO
   retention_days: 14

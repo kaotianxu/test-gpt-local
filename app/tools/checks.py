@@ -9,6 +9,7 @@ delegates to the same underlying PowerShell execution as ``run_pwsh``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import subprocess
@@ -308,7 +309,8 @@ def register_tools(mcp: FastMCP) -> None:
             wait,
             idempotency_key,
         )
-        return with_idempotency(
+        return await asyncio.to_thread(
+            with_idempotency,
             idempotency_key,
             "run_check",
             {"workspace_id": workspace_id, "check_id": check_id, "wait": wait},
