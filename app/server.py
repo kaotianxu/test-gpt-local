@@ -15,7 +15,9 @@ from app.config import (
     get_server_bind,
     load_operator_config,
 )
+from app.services.process_manager import ProcessManager
 from app.storage import database as db
+from app.storage.database import Database
 from app.tools import (
     artifacts,
     capabilities,
@@ -61,7 +63,11 @@ def create_app() -> FastMCP:
     data_dir = Path(__file__).resolve().parent.parent / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     db.init_db(data_dir / "operator.db")
-    orphaned = db.interrupt_incomplete_processes()
+    database = Database(data_dir / "operator.db")
+    # Tools share an explicitly app-scoped manager; independently constructed
+    # managers (notably tests) remain isolated from this singleton.
+    ProcessManager.configure_instance(ProcessManager(database=database))
+    orphaned = database.interrupt_incomplete_processes()
     if orphaned:
         log.warning("marked %d orphaned process record(s) as interrupted", orphaned)
 

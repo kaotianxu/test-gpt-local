@@ -45,6 +45,27 @@ pip install mcp[cli] pyyaml aiofile
 
 The server starts on `http://127.0.0.1:8765` with health check at `/healthz`.
 
+## MCP Smoke Test
+
+With the MCP server running, execute the read-only contract smoke test:
+
+```powershell
+.\scripts\smoke-test.ps1
+```
+
+It checks `/healthz`, protected-resource discovery, MCP initialization,
+required tool discovery, `get_capabilities`, `ping`, and project discovery.
+The test does not create or modify a workspace by default. To also validate
+the isolated worktree lifecycle, explicitly provide a configured project and
+enable the opt-in test:
+
+```powershell
+.\scripts\smoke-test.ps1 -ProjectId phase4-order-fixture -Mutating
+```
+
+The extended test creates one temporary Git worktree and removes it in a
+`finally` cleanup block. For a non-default endpoint, pass `-McpUrl`.
+
 ## Background Service (Recommended)
 
 Phase 5 can run the MCP server and Secure MCP Tunnel under one user-level background

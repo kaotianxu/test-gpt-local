@@ -8,6 +8,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -21,11 +22,17 @@ _local = threading.local()
 _DB_LOCK = threading.RLock()
 
 
+def _effective_db_path() -> Path:
+    """Return the database selected for the current call/thread."""
+    return cast(Path, getattr(_local, "override_path", _DB_PATH))
+
+
 def _get_connection() -> sqlite3.Connection:
     """Get a thread-local database connection."""
+    db_path = _effective_db_path()
     existing = getattr(_local, "conn", None)
     existing_path = getattr(_local, "db_path", None)
-    if existing is not None and existing_path != str(_DB_PATH):
+    if existing is not None and existing_path != str(db_path):
         try:
             existing.close()
         finally:
@@ -33,13 +40,74 @@ def _get_connection() -> sqlite3.Connection:
             _local.db_path = None
 
     if not hasattr(_local, "conn") or _local.conn is None:
-        _local.conn = sqlite3.connect(str(_DB_PATH), timeout=30.0)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        _local.conn = sqlite3.connect(str(db_path), timeout=30.0)
         _local.conn.row_factory = sqlite3.Row
         _local.conn.execute("PRAGMA journal_mode=WAL")
         _local.conn.execute("PRAGMA busy_timeout=30000")
         _local.conn.execute("PRAGMA foreign_keys=ON")
-        _local.db_path = str(_DB_PATH)
+        _local.db_path = str(db_path)
     return cast(sqlite3.Connection, _local.conn)
+
+
+class Database:
+    """An isolated database handle suitable for dependency injection.
+
+    The legacy module-level functions remain the production default.  A
+    ``Database`` instance selects its own path for every operation, including
+    calls made by process-manager watchdog threads, so tests and independent
+    managers cannot leak connections or state into one another.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path).resolve()
+
+    @contextmanager
+    def _activated(self) -> Any:
+        previous = getattr(_local, "override_path", None)
+        _local.override_path = self.path
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    del _local.override_path
+                except AttributeError:
+                    pass
+            else:
+                _local.override_path = previous
+
+    def connect(self) -> sqlite3.Connection:
+        """Return this database's connection for the current thread."""
+        with self._activated():
+            return _get_connection()
+
+    def init_db(self) -> None:
+        """Initialize this database without changing the process default."""
+        with self._activated():
+            init_db()
+
+    def close(self) -> None:
+        """Close this database's connection on the current thread, if open."""
+        if getattr(_local, "db_path", None) != str(self.path):
+            return
+        connection = getattr(_local, "conn", None)
+        if connection is not None:
+            connection.close()
+        _local.conn = None
+        _local.db_path = None
+
+    def __getattr__(self, name: str) -> Any:
+        """Bind a legacy CRUD helper to this instance's database path."""
+        helper = globals().get(name)
+        if not callable(helper) or name.startswith("_"):
+            raise AttributeError(name)
+
+        def bound(*args: Any, **kwargs: Any) -> Any:
+            with self._activated():
+                return helper(*args, **kwargs)
+
+        return bound
 
 
 def init_db(db_path: str | Path | None = None) -> None:

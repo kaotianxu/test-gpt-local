@@ -35,3 +35,7 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "smoke: live, read-only MCP contract smoke test",
+    "smoke_mutating: smoke test that creates and deletes a Git worktree",
+]

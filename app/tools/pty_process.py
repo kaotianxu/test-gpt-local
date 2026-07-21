@@ -32,7 +32,6 @@ from app.services.envelope import (
 from app.services.path_guard import is_denied, resolve_within
 from app.services.process_manager import ProcessManager
 from app.services.workspace_manager import get_workspace
-from app.storage import database as db
 
 log = logging.getLogger(__name__)
 
@@ -231,7 +230,18 @@ def _write_process_input(
     """
     start = time.monotonic()
     request_id = generate_request_id()
-    record = db.get_process(process_id)
+
+    # Reject an intrinsically invalid request before consulting storage.
+    if not text and not append_newline:
+        return error_result(
+            "INVALID_INPUT",
+            "text must be non-empty when append_newline is False",
+            request_id=request_id,
+            extra={"process_id": process_id},
+        )
+
+    pm = ProcessManager.get_instance()
+    record = pm.get_record(process_id)
     workspace_id = str(record["workspace_id"]) if record else None
 
     def fail(code: str, message: str) -> dict[str, Any]:
@@ -243,10 +253,6 @@ def _write_process_input(
         )
         return error_result(code, message, request_id=request_id, extra={"process_id": process_id})
 
-    if not text and not append_newline:
-        return fail("INVALID_INPUT", "text must be non-empty when append_newline is False")
-
-    pm = ProcessManager.get_instance()
     result = pm.write_input(process_id, text, append_newline=append_newline)
 
     if "error" in result:
@@ -281,7 +287,18 @@ def _send_process_signal(
     """
     start = time.monotonic()
     request_id = generate_request_id()
-    record = db.get_process(process_id)
+
+    supported_signals = ("interrupt", "eof", "terminate")
+    if signal not in supported_signals:
+        return error_result(
+            "INVALID_INPUT",
+            f"signal must be one of {supported_signals}, got: {signal!r}",
+            request_id=request_id,
+            extra={"process_id": process_id},
+        )
+
+    pm = ProcessManager.get_instance()
+    record = pm.get_record(process_id)
     workspace_id = str(record["workspace_id"]) if record else None
 
     def fail(code: str, message: str) -> dict[str, Any]:
@@ -293,11 +310,6 @@ def _send_process_signal(
         )
         return error_result(code, message, request_id=request_id, extra={"process_id": process_id})
 
-    supported_signals = ("interrupt", "eof", "terminate")
-    if signal not in supported_signals:
-        return fail("INVALID_INPUT", f"signal must be one of {supported_signals}, got: {signal!r}")
-
-    pm = ProcessManager.get_instance()
     result = pm.send_signal(process_id, signal)
 
     if "error" in result:

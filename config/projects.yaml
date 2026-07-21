@@ -51,6 +51,70 @@ projects:
       inherit_user_environment: true
 
     checks:
+      section1_acceptance:
+        description: Verify database/process isolation, randomized ordering, parallel execution, lint, and types.
+        script: |
+          python scripts/accept-section1.py
+        timeout_seconds: 1800
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+
+      section2_acceptance:
+        description: Verify the central ToolSpec registry, middleware, errors, versioning, and idempotency contract.
+        script: |
+          python scripts/accept-iteration.py --section 2
+        timeout_seconds: 600
+
+      section3_acceptance:
+        description: Verify keyed fair scheduling, resource limits, and restart recovery contracts.
+        script: |
+          python scripts/accept-iteration.py --section 3
+        timeout_seconds: 600
+
+      section4_acceptance:
+        description: Verify the symbol-level code-intelligence tool surface.
+        script: |
+          python scripts/accept-iteration.py --section 4
+        timeout_seconds: 600
+
+      section5_acceptance:
+        description: Verify append-only events, cursors, and process subscription contracts.
+        script: |
+          python scripts/accept-iteration.py --section 5
+        timeout_seconds: 600
+
+      section6_acceptance:
+        description: Verify atomic multi-file change-set lifecycle operations.
+        script: |
+          python scripts/accept-iteration.py --section 6
+        timeout_seconds: 600
+
+      section7_acceptance:
+        description: Verify structured plan evidence and dependency-aware check execution.
+        script: |
+          python scripts/accept-iteration.py --section 7
+        timeout_seconds: 600
+
+      section8_acceptance:
+        description: Verify streaming large-file, cursor, and artifact-cache contracts.
+        script: |
+          python scripts/accept-iteration.py --section 8
+        timeout_seconds: 600
+
+      section9_acceptance:
+        description: Verify portable configuration, SQL migrations, and dependency locking.
+        script: |
+          python scripts/accept-iteration.py --section 9
+        timeout_seconds: 600
+
+      iteration_acceptance:
+        description: Run all iteration-plan acceptance gates; incomplete roadmap sections fail explicitly.
+        script: |
+          python scripts/accept-iteration.py --section all
+        timeout_seconds: 3600
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+
       unit_tests:
         script: |
           python -m pytest -q

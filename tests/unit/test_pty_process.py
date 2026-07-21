@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from app.services.process_manager import ProcessManager, _PseudoProcess, _RunningProcess
-from app.storage import database as db
+from app.storage.database import Database
 from app.tools.pty_process import (
     _run_command,
     _send_process_signal,
@@ -27,11 +28,42 @@ from app.tools.pty_process import (
 # ---------------------------------------------------------------------------
 
 
-def _create_workspace_db(workspace_id: str, worktree: Path) -> None:
+@pytest.fixture(autouse=True)
+def isolated_process_manager(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Iterator[ProcessManager]:
+    """Give every test independent DB, process registry, and output paths."""
+    database = Database(tmp_path / "operator.db")
+    database.init_db()
+    manager = ProcessManager(
+        database=database,
+        config={
+            "max_running_jobs": 3,
+            "max_output_chars": 200000,
+            "default_timeout_seconds": 10,
+            "max_timeout_seconds": 60,
+            "register_artifacts": False,
+        },
+        processes_dir=tmp_path / "processes",
+    )
+    monkeypatch.setattr(
+        ProcessManager,
+        "get_instance",
+        classmethod(lambda cls: manager),
+    )
+    yield manager
+    for process_id in list(manager._running):
+        manager.cancel(process_id)
+    database.close()
+
+
+def _create_workspace_db(
+    database: Database, workspace_id: str, worktree: Path
+) -> None:
     """Insert a workspace record into the test database."""
     from app.storage.database import _now_iso
 
-    conn = db._get_connection()
+    conn = database.connect()
     conn.execute(
         """INSERT OR IGNORE INTO workspaces
            (workspace_id, project_id, task_name, worktree_path, base_commit,
@@ -83,9 +115,11 @@ def _mock_project(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pty_mod, "get_project", fake_get_project)
 
 
-def _add_process_to_db(process_id: str, workspace_id: str) -> None:
+def _add_process_to_db(
+    database: Database, process_id: str, workspace_id: str
+) -> None:
     """Add a minimal process record to the database."""
-    db.insert_process(
+    database.insert_process(
         process_id=process_id,
         workspace_id=workspace_id,
         tool_name="run_command",
@@ -93,12 +127,29 @@ def _add_process_to_db(process_id: str, workspace_id: str) -> None:
         script_preview="test",
         working_directory=str(Path.cwd()),
     )
-    db.update_process_status(process_id, "running")
+    database.update_process_status(process_id, "running")
 
 
 # ---------------------------------------------------------------------------
 # _PseudoProcess
 # ---------------------------------------------------------------------------
+
+
+def test_database_instances_are_isolated(tmp_path: Path) -> None:
+    """Two databases used on the same thread must never share state."""
+    first = Database(tmp_path / "first.db")
+    second = Database(tmp_path / "second.db")
+    first.init_db()
+    second.init_db()
+
+    first.insert_workspace(
+        "ws-00000001", "project", "first", str(tmp_path), "deadbeef"
+    )
+
+    assert first.get_workspace("ws-00000001") is not None
+    assert second.get_workspace("ws-00000001") is None
+    first.close()
+    second.close()
 
 
 class TestPseudoProcess:
@@ -137,7 +188,7 @@ class TestRunningProcessStdin:
         rp = _RunningProcess(
             process_id="pr-00000001",
             workspace_id="ws-00000001",
-            proc=proc,  # type: ignore[arg-type]
+            proc=proc,
             stdout_path=tmp_path / "stdout.txt",
             stderr_path=tmp_path / "stderr.txt",
             working_directory=tmp_path,
@@ -165,7 +216,7 @@ class TestRunningProcessStdin:
         rp = _RunningProcess(
             process_id="pr-00000002",
             workspace_id="ws-00000001",
-            proc=proc,  # type: ignore[arg-type]
+            proc=proc,
             stdout_path=tmp_path / "stdout.txt",
             stderr_path=tmp_path / "stderr.txt",
             working_directory=tmp_path,
@@ -195,7 +246,7 @@ class TestRunningProcessStdin:
         rp = _RunningProcess(
             process_id="pr-00000003",
             workspace_id="ws-00000001",
-            proc=proc,  # type: ignore[arg-type]
+            proc=proc,
             stdout_path=tmp_path / "stdout.txt",
             stderr_path=tmp_path / "stderr.txt",
             working_directory=tmp_path,
@@ -219,7 +270,7 @@ class TestProcessManagerWriteInput:
         pm = ProcessManager.get_instance()
         worktree = tmp_path / "worktree"
         worktree.mkdir(parents=True, exist_ok=True)
-        _create_workspace_db("ws-00000001", worktree)
+        _create_workspace_db(pm._database, "ws-00000001", worktree)
 
         # Start a Python process that reads from stdin line by line.
         result = pm.spawn_interactive(
@@ -267,7 +318,7 @@ class TestProcessManagerWriteInput:
         pm = ProcessManager.get_instance()
         worktree = tmp_path / "worktree2"
         worktree.mkdir(parents=True, exist_ok=True)
-        _create_workspace_db("ws-00000002", worktree)
+        _create_workspace_db(pm._database, "ws-00000002", worktree)
 
         # Start a quick process.
         result = pm.spawn_interactive(
@@ -308,7 +359,7 @@ class TestProcessManagerSendSignal:
         pm = ProcessManager.get_instance()
         worktree = tmp_path / "worktree3"
         worktree.mkdir(parents=True, exist_ok=True)
-        _create_workspace_db("ws-00000003", worktree)
+        _create_workspace_db(pm._database, "ws-00000003", worktree)
 
         result = pm.spawn_interactive(
             workspace_id="ws-00000003",
@@ -343,7 +394,7 @@ class TestProcessManagerSendSignal:
         pm = ProcessManager.get_instance()
         worktree = tmp_path / "worktree4"
         worktree.mkdir(parents=True, exist_ok=True)
-        _create_workspace_db("ws-00000004", worktree)
+        _create_workspace_db(pm._database, "ws-00000004", worktree)
 
         # Start a long-running process.
         result = pm.spawn_interactive(

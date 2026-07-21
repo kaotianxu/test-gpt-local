@@ -24,9 +24,10 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from app.config import (
     BASE_DIR,
@@ -34,6 +35,7 @@ from app.config import (
     get_proxy_config,
 )
 from app.storage import database as db
+from app.storage.database import Database
 
 log = logging.getLogger(__name__)
 
@@ -213,27 +215,36 @@ class _RunningProcess:
 
 
 class ProcessManager:
-    """Singleton that manages subprocess lifecycle.
+    """Thread-safe subprocess lifecycle manager.
 
-    Thread-safe.  Use ``ProcessManager.get_instance()`` to obtain the
-    shared instance.
+    Production callers may use :meth:`get_instance`; tests and app factories
+    can construct an isolated manager by injecting a :class:`Database`.
     """
 
     _instance: ProcessManager | None = None
     _instance_lock = threading.Lock()
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        database: Database | None = None,
+        config: Mapping[str, Any] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        processes_dir: Path | None = None,
+    ) -> None:
         self._lock = threading.RLock()
+        self._database: Any = database if database is not None else db
+        self._clock = clock
         # process_id -> _RunningProcess
         self._running: dict[str, _RunningProcess] = {}
-        self._processes_dir = BASE_DIR / "data" / "processes"
+        self._processes_dir = processes_dir or BASE_DIR / "data" / "processes"
         self._processes_dir.mkdir(parents=True, exist_ok=True)
 
-        cfg = get_process_config()
+        cfg = config if config is not None else get_process_config()
         self._max_running = int(cfg.get("max_running_jobs", 3))
         self._max_output_chars = int(cfg.get("max_output_chars", 200000))
         self._default_timeout = int(cfg.get("default_timeout_seconds", 600))
         self._max_timeout = int(cfg.get("max_timeout_seconds", 3600))
+        self._register_artifacts = bool(cfg.get("register_artifacts", True))
         self._slots = threading.BoundedSemaphore(self._max_running)
 
     # ---- Public API --------------------------------------------------------
@@ -246,6 +257,16 @@ class ProcessManager:
                 if cls._instance is None:
                     cls._instance = cls()
         return cls._instance
+
+    @classmethod
+    def configure_instance(cls, manager: ProcessManager) -> None:
+        """Install the app-scoped manager before tools begin serving calls."""
+        with cls._instance_lock:
+            cls._instance = manager
+
+    def get_record(self, process_id: str) -> dict[str, Any] | None:
+        """Return the process record from this manager's state store."""
+        return cast(dict[str, Any] | None, self._database.get_process(process_id))
 
     def spawn(
         self,
@@ -301,7 +322,7 @@ class ProcessManager:
         script_preview = script[:200]
 
         # ---- write DB record ----
-        db.insert_process(
+        self._database.insert_process(
             process_id=process_id,
             workspace_id=workspace_id,
             tool_name=tool_name,
@@ -311,15 +332,15 @@ class ProcessManager:
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
         )
-        db.update_process_status(process_id, "running")
+        self._database.update_process_status(process_id, "running")
 
         # ---- spawn subprocess ----
         try:
             stdout_file = open(stdout_path, "w", encoding="utf-8")
             stderr_file = open(stderr_path, "w", encoding="utf-8")
         except OSError as exc:
-            db.update_process_status(process_id, "failed", exit_code=-1)
-            db.complete_operation(process_id)
+            self._database.update_process_status(process_id, "failed", exit_code=-1)
+            self._database.complete_operation(process_id)
             self._slots.release()
             return {
                 "error": f"cannot open output files: {exc}",
@@ -356,7 +377,7 @@ class ProcessManager:
         except FileNotFoundError:
             stdout_file.close()
             stderr_file.close()
-            db.update_process_status(process_id, "failed", exit_code=-1)
+            self._database.update_process_status(process_id, "failed", exit_code=-1)
             self._slots.release()
             return {
                 "error": f"pwsh executable not found: {pwsh_path}",
@@ -365,7 +386,7 @@ class ProcessManager:
         except OSError as exc:
             stdout_file.close()
             stderr_file.close()
-            db.update_process_status(process_id, "failed", exit_code=-1)
+            self._database.update_process_status(process_id, "failed", exit_code=-1)
             self._slots.release()
             return {
                 "error": f"cannot start pwsh: {exc}",
@@ -380,7 +401,7 @@ class ProcessManager:
         except OSError:
             pass  # will be picked up by the watchdog
 
-        deadline = time.monotonic() + timeout
+        deadline = self._clock() + timeout
         rp = _RunningProcess(
             process_id=process_id,
             workspace_id=workspace_id,
@@ -422,7 +443,7 @@ class ProcessManager:
         if rp is not None:
             self._check_exit(rp)
 
-        record = db.get_process(process_id)
+        record = self._database.get_process(process_id)
         if record is None:
             return {"error": f"process not found: {process_id}", "process_id": process_id}
 
@@ -444,7 +465,7 @@ class ProcessManager:
 
         rp = self._get_running(process_id)
         if rp is None:
-            record = db.get_process(process_id)
+            record = self._database.get_process(process_id)
             if record is None:
                 return {
                     "error": f"process not found: {process_id}",
@@ -467,7 +488,7 @@ class ProcessManager:
                 rp.proc.terminate()
             except OSError:
                 pass
-        db.update_process_status(
+        self._database.update_process_status(
             process_id,
             status="cancelled",
             completed_at=_now_iso(),
@@ -502,7 +523,7 @@ class ProcessManager:
         """Delete controlled process-output directories for a workspace."""
         removed = 0
         root = self._processes_dir.resolve()
-        for process in db.list_processes(workspace_id):
+        for process in self._database.list_processes(workspace_id):
             process_id = str(process.get("process_id", ""))
             if not _PROCESS_ID_RE.match(process_id):
                 continue
@@ -581,7 +602,7 @@ class ProcessManager:
         # ---- write DB record ----
         script_preview = command[:200]
         script_sha256 = hashlib.sha256(command.encode("utf-8")).hexdigest() if command else ""
-        db.insert_process(
+        self._database.insert_process(
             process_id=process_id,
             workspace_id=workspace_id,
             tool_name=tool_name,
@@ -591,7 +612,7 @@ class ProcessManager:
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
         )
-        db.update_process_status(process_id, "running")
+        self._database.update_process_status(process_id, "running")
 
         # ---- Build the command line ----
         cmd_parts = self._build_command_line(shell, command)
@@ -611,7 +632,7 @@ class ProcessManager:
 
         use_conpty = tty and _has_conpty()
         if tty and os.name == "nt" and not use_conpty:
-            db.update_process_status(process_id, "failed", exit_code=-1)
+            self._database.update_process_status(process_id, "failed", exit_code=-1)
             self._slots.release()
             return {
                 "error": "ConPTY is unavailable on this Windows host",
@@ -686,7 +707,7 @@ class ProcessManager:
                         conpty_wrapper.close(pty_handle, pty_input_write, pty_output_read)
                     except Exception:
                         pass
-                db.update_process_status(process_id, "failed", exit_code=-1)
+                self._database.update_process_status(process_id, "failed", exit_code=-1)
                 self._slots.release()
                 return {
                     "error": f"ConPTY creation failed: {exc}",
@@ -700,7 +721,7 @@ class ProcessManager:
                 stdout_file = open(stdout_path, "w", encoding="utf-8")
                 stderr_file = open(stderr_path, "w", encoding="utf-8")
             except OSError as exc:
-                db.update_process_status(process_id, "failed", exit_code=-1)
+                self._database.update_process_status(process_id, "failed", exit_code=-1)
                 self._slots.release()
                 return {
                     "error": f"cannot open output files: {exc}",
@@ -729,7 +750,7 @@ class ProcessManager:
             except FileNotFoundError:
                 stdout_file.close()
                 stderr_file.close()
-                db.update_process_status(process_id, "failed", exit_code=-1)
+                self._database.update_process_status(process_id, "failed", exit_code=-1)
                 self._slots.release()
                 return {
                     "error": f"executable not found: {cmd_parts[0] if cmd_parts else command}",
@@ -738,13 +759,13 @@ class ProcessManager:
             except OSError as exc:
                 stdout_file.close()
                 stderr_file.close()
-                db.update_process_status(process_id, "failed", exit_code=-1)
+                self._database.update_process_status(process_id, "failed", exit_code=-1)
                 return {
                     "error": f"cannot start process: {exc}",
                     "process_id": process_id,
                 }
 
-        deadline = time.monotonic() + timeout
+        deadline = self._clock() + timeout
         rp = _RunningProcess(
             process_id=process_id,
             workspace_id=workspace_id,
@@ -796,7 +817,7 @@ class ProcessManager:
 
         rp = self._get_running(process_id)
         if rp is None:
-            record = db.get_process(process_id)
+            record = self._database.get_process(process_id)
             if record is None:
                 return {"error": f"process not found: {process_id}"}
             return {"error": f"process is not running: status={record['status']}"}
@@ -828,7 +849,7 @@ class ProcessManager:
 
         rp = self._get_running(process_id)
         if rp is None:
-            record = db.get_process(process_id)
+            record = self._database.get_process(process_id)
             if record is None:
                 return {"error": f"process not found: {process_id}"}
             return {"error": f"process is not running: status={record['status']}"}
@@ -850,7 +871,7 @@ class ProcessManager:
             return {"error": "terminal dimensions must be columns 20-500 and rows 5-200"}
         rp = self._get_running(process_id)
         if rp is None:
-            record = db.get_process(process_id)
+            record = self._database.get_process(process_id)
             if record is None:
                 return {"error": f"process not found: {process_id}"}
             return {"error": f"process is not running: status={record['status']}"}
@@ -968,11 +989,11 @@ class ProcessManager:
         """Record process completion and remove from the running table."""
         now = _now_iso()
         status = "passed" if exit_code == 0 else "failed"
-        record = db.get_process(rp.process_id)
+        record = self._database.get_process(rp.process_id)
         # A concurrent cancel/timeout is authoritative; process exit observed
         # a moment later must not rewrite that terminal state.
         if record is None or record.get("status") not in {"cancelled", "timed_out"}:
-            db.update_process_status(
+            self._database.update_process_status(
                 rp.process_id,
                 status=status,
                 exit_code=exit_code,
@@ -1010,7 +1031,7 @@ class ProcessManager:
             summary = f"git status after pwsh unavailable: {exc}"
 
         try:
-            db.log_operation(
+            self._database.log_operation(
                 operation_id=_short_id(),
                 tool_name="run_pwsh",
                 summary=summary,
@@ -1022,7 +1043,7 @@ class ProcessManager:
 
     def _watchdog(self, rp: _RunningProcess) -> None:
         """Background thread: wait for process exit or timeout."""
-        remaining = rp.deadline - time.monotonic()
+        remaining = rp.deadline - self._clock()
         if remaining > 0:
             exited = rp.wait(timeout=remaining)
         else:
@@ -1040,7 +1061,7 @@ class ProcessManager:
                 rp.proc.terminate()
             except OSError:
                 pass
-            db.update_process_status(
+            self._database.update_process_status(
                 rp.process_id,
                 status="timed_out",
                 exit_code=-1,
@@ -1130,6 +1151,8 @@ class ProcessManager:
 
     def _register_process_artifacts(self, rp: _RunningProcess) -> None:
         """Discover workspace outputs and retain complete process logs."""
+        if not self._register_artifacts:
+            return
         try:
             from app.services import artifact_registry
 
@@ -1171,7 +1194,7 @@ class ProcessManager:
             "stdout_tail": stdout_tail,
             "stderr_tail": stderr_tail,
             "truncated": stdout_truncated or stderr_truncated,
-            "artifacts": db.list_artifacts_for_process(
+            "artifacts": self._database.list_artifacts_for_process(
                 str(record["workspace_id"]), str(record["process_id"])
             ),
         }
