@@ -1,6 +1,6 @@
 [project]
 name = "gpt-local-code-operator"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local MCP Server for GPT-powered code operations"
 requires-python = ">=3.12"
 dependencies = [

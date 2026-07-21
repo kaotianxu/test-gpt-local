@@ -6,6 +6,10 @@ GPT can adapt its tool calls to what the current server supports.
 
 from __future__ import annotations
 
+import tomllib
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
@@ -15,43 +19,70 @@ from app.config import (
     get_process_config,
     load_operator_config,
 )
+from app.services.tool_registry import (
+    IdempotencyPolicy,
+    list_tool_specs,
+    tool_contracts,
+)
 
-SERVER_VERSION = "0.2.0"
+
+def _server_version() -> str:
+    """Read installed metadata, falling back to pyproject in a source checkout."""
+    try:
+        return version("gpt-local-code-operator")
+    except PackageNotFoundError:
+        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        return str(data["project"]["version"])
+
+
+SERVER_VERSION = _server_version()
 SCHEMA_VERSION = "1.0.0"
 
 
 def _build_capabilities() -> dict[str, object]:
-    """Return the server capabilities dictionary."""
+    """Return capabilities derived from the central ToolSpec registry."""
     proc_cfg = get_process_config()
     files_cfg = get_files_config()
     artifact_cfg = get_artifact_config()
     ws_cfg = load_operator_config().get("workspace", {})
 
-    caps: dict[str, bool] = {
-        "supports_async_process": True,
-        "supports_expected_hash": True,
-        "supports_idempotency": True,
-        "supports_artifacts": True,
-        "supports_multi_query_search": True,
-        "supports_diff_context_lines": True,
-        "supports_diff_stat_only": True,
-        "supports_project_manifest": True,
-        "supports_read_process_output": True,
-        "supports_view_image": True,
-        "supports_pty": True,
-        "supports_process_input": True,
-        "supports_process_signal": True,
-        "supports_terminal_resize": True,
-        "supports_artifact_registry": True,
-        "supports_artifact_discovery": True,
-        "supports_workspace_plan": True,
+    specs = list_tool_specs()
+    tool_names = {spec.name for spec in specs}
+    requirements: dict[str, set[str]] = {
+        "supports_async_process": {"run_pwsh", "get_process_result"},
+        "supports_expected_hash": {"read_files", "apply_patch", "replace_text"},
+        "supports_artifacts": {"list_artifacts", "read_artifact", "view_artifact"},
+        "supports_multi_query_search": {"search_code"},
+        "supports_diff_context_lines": {"git_diff"},
+        "supports_diff_stat_only": {"git_diff"},
+        "supports_project_manifest": {"create_workspace"},
+        "supports_read_process_output": {"read_process_output"},
+        "supports_view_image": {"view_image"},
+        "supports_pty": {"run_command"},
+        "supports_process_input": {"write_process_input"},
+        "supports_process_signal": {"send_process_signal"},
+        "supports_terminal_resize": {"resize_terminal"},
+        "supports_artifact_registry": {"list_artifacts"},
+        "supports_artifact_discovery": {"list_artifacts"},
+        "supports_workspace_plan": {
+            "get_workspace_plan",
+            "update_workspace_plan",
+            "update_workspace_plan_step",
+        },
     }
+    caps = {name: required <= tool_names for name, required in requirements.items()}
+    caps["supports_idempotency"] = any(
+        spec.idempotency is not IdempotencyPolicy.NONE for spec in specs
+    )
 
     return {
         "schema_version": SCHEMA_VERSION,
         "server_version": SERVER_VERSION,
         "server_name": "gpt-local-code-operator",
         "capabilities": caps,
+        "registered_tool_count": len(specs),
+        "tools": tool_contracts(),
         "limits": {
             "max_read_chars": int(files_cfg.get("max_read_chars", 100000)),
             "max_output_chars": int(proc_cfg.get("max_output_chars", 200000)),

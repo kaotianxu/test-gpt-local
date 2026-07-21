@@ -11,6 +11,7 @@ import importlib
 import importlib.metadata
 import inspect
 import re
+import tomllib
 from dataclasses import fields, is_dataclass
 from pathlib import Path
 from types import ModuleType
@@ -35,6 +36,15 @@ def _require_names(module: ModuleType, names: set[str], requirement: str) -> Non
 
 def _text(relative_path: str) -> str:
     return (ROOT / relative_path).read_text(encoding="utf-8")
+
+
+def _package_version() -> str:
+    """Resolve installed metadata or the same source declaration in a checkout."""
+    try:
+        return importlib.metadata.version("gpt-local-code-operator")
+    except importlib.metadata.PackageNotFoundError:
+        pyproject = tomllib.loads(_text("pyproject.toml"))
+        return str(pyproject["project"]["version"])
 
 
 def test_section_2_central_tool_contract_and_middleware() -> None:
@@ -66,8 +76,7 @@ def test_section_2_errors_version_and_idempotency_are_consistent() -> None:
     assert "PTY_NOT_ACTIVE" in envelope
 
     capabilities = importlib.import_module("app.tools.capabilities")
-    package_version = importlib.metadata.version("gpt-local-code-operator")
-    assert capabilities.SERVER_VERSION == package_version
+    assert capabilities.SERVER_VERSION == _package_version()
 
     powershell = _text("app/tools/powershell.py")
     assert re.search(

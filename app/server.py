@@ -5,6 +5,7 @@ Starts a FastMCP server with Streamable HTTP transport on 127.0.0.1:8765.
 
 import logging
 from pathlib import Path
+from typing import cast
 
 from mcp.server.fastmcp import FastMCP
 from starlette.responses import JSONResponse
@@ -16,6 +17,7 @@ from app.config import (
     load_operator_config,
 )
 from app.services.process_manager import ProcessManager
+from app.services.tool_registry import RegisteredToolMCP
 from app.storage import database as db
 from app.storage.database import Database
 from app.tools import (
@@ -138,37 +140,44 @@ def create_app() -> FastMCP:
         return JSONResponse({"status": "ok", "service": "gpt-local-code-operator"})
 
     # ---- Register MCP tools ----
-    projects.register_tools(mcp)
-    capabilities.register_tools(mcp)
-    workspaces.register_tools(mcp)
-    repo_map.register_tools(mcp)
-    search.register_tools(mcp)
-    reader.register_tools(mcp)
-    git_tools.register_tools(mcp)
-    reports.register_tools(mcp)
+    # Preserve each public signature while routing all invocations through the
+    # central ToolSpec execution middleware.
+    registry_mcp = RegisteredToolMCP(mcp)
+    tool_mcp = cast(FastMCP, registry_mcp)
+
+    projects.register_tools(tool_mcp)
+    capabilities.register_tools(tool_mcp)
+    workspaces.register_tools(tool_mcp)
+    repo_map.register_tools(tool_mcp)
+    search.register_tools(tool_mcp)
+    reader.register_tools(tool_mcp)
+    git_tools.register_tools(tool_mcp)
+    reports.register_tools(tool_mcp)
 
     # Phase 2: patch application.
-    patcher.register_tools(mcp)
+    patcher.register_tools(tool_mcp)
 
     # Phase 3: PowerShell execution.
-    powershell.register_tools(mcp)
+    powershell.register_tools(tool_mcp)
 
     # Phase 4: check shortcuts.
-    checks.register_tools(mcp)
+    checks.register_tools(tool_mcp)
     # (run_check, list_checks)
     # here as they are implemented.
 
     # Phase 5: view_image.
-    view_image.register_tools(mcp)
+    view_image.register_tools(tool_mcp)
 
     # Phase 5: PTY / interactive process.
-    pty_process.register_tools(mcp)
+    pty_process.register_tools(tool_mcp)
 
     # Phase 5: artifact registry.
-    artifacts.register_tools(mcp)
+    artifacts.register_tools(tool_mcp)
 
     # Phase 5: workspace plan.
-    plans.register_tools(mcp)
+    plans.register_tools(tool_mcp)
+
+    registry_mcp.validate_coverage()
 
     return mcp
 

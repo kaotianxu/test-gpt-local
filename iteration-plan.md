@@ -76,6 +76,8 @@ record = database.get_process(process_id)
 
 ## 2. 建立统一的 ToolSpec 和中央执行中间件
 
+- [x] done
+
 现在各工具的行为仍有明显漂移：
 
 * `reader.py` 使用统一 envelope

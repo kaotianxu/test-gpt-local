@@ -13,8 +13,13 @@ Stable error codes
 - ``FILE_CHANGED`` — file content SHA-256 does not match the caller's expectation
 - ``PATCH_CONFLICT`` — ``git apply --check`` rejected the patch
 - ``PATH_DENIED`` — path is absolute, traverses ``..``, or is on the deny list
+- ``PROCESS_NOT_FOUND`` — process_id does not exist
+- ``PROCESS_NOT_RUNNING`` — process exists but is no longer accepting control/input
+- ``PTY_NOT_ACTIVE`` — process exists but has no active pseudo-terminal
 - ``PROCESS_TIMEOUT`` — command exceeded its allowed runtime
 - ``PROCESS_CANCELLED`` — command was explicitly cancelled
+- ``FILE_NOT_FOUND`` — requested file or artifact does not exist
+- ``PERMISSION_DENIED`` — the active permission profile rejected the operation
 - ``OUTPUT_TRUNCATED`` — response was truncated to stay within size limits
 - ``CHECK_FAILED`` — ``run_check`` completed with a non-zero exit code
 - ``CHECK_NOT_FOUND`` — check_id does not exist in the project config

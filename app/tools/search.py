@@ -17,7 +17,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from app.services.envelope import ok_result
+from app.services.envelope import error_result, ok_result
 from app.services.path_guard import is_denied, resolve_within
 from app.services.workspace_manager import get_workspace
 
@@ -64,7 +64,11 @@ def _search(
 ) -> dict[str, Any]:
     record = get_workspace(workspace_id)
     if record is None:
-        return {"error": f"workspace not found: {workspace_id}", "workspace_id": workspace_id}
+        return error_result(
+            "WORKSPACE_NOT_FOUND",
+            f"workspace not found: {workspace_id}",
+            workspace_id=workspace_id,
+        )
     worktree = Path(record["worktree_path"])
 
     # Multi-query mode: run several searches and aggregate results.
@@ -77,17 +81,34 @@ def _search(
         q = _validate_query(query) if query else ""
         target = _validate_path(worktree, path)
     except ValueError as exc:
-        return {"error": str(exc), "workspace_id": workspace_id, "query": query}
+        code = "PATH_DENIED" if "path" in str(exc).lower() else "INVALID_INPUT"
+        return error_result(
+            code,
+            str(exc),
+            workspace_id=workspace_id,
+            extra={"query": query},
+        )
 
     if not q:
-        return {"error": "query or queries must be provided", "workspace_id": workspace_id}
+        return error_result(
+            "INVALID_INPUT",
+            "query or queries must be provided",
+            workspace_id=workspace_id,
+        )
 
     context_lines = max(0, min(int(context_lines), 10))
     if max_results <= 0:
         max_results = _DEFAULT_MAX_RESULTS
     max_results = min(max_results, _HARD_MAX_RESULTS)
 
-    rg = _resolve_rg()
+    try:
+        rg = _resolve_rg()
+    except RuntimeError as exc:
+        return error_result(
+            "INTERNAL_ERROR",
+            str(exc),
+            workspace_id=workspace_id,
+        )
     cmd = [
         rg,
         "--json",
@@ -110,22 +131,23 @@ def _search(
             timeout=30,
         )
     except subprocess.TimeoutExpired:
-        return {
-            "workspace_id": workspace_id,
-            "query": q,
-            "path": path or ".",
-            "error": "ripgrep timed out after 30s",
-        }
+        return error_result(
+            "PROCESS_TIMEOUT",
+            "ripgrep timed out after 30s",
+            retryable=True,
+            workspace_id=workspace_id,
+            extra={"query": q, "path": path or "."},
+        )
 
     # rg exits 1 when no matches are found, 0 when matches are found,
     # 2 on real errors. Map all to a structured result.
     if proc.returncode not in (0, 1) and not proc.stdout:
-        return {
-            "workspace_id": workspace_id,
-            "query": q,
-            "path": path or ".",
-            "error": (proc.stderr or "").strip() or f"rg exited {proc.returncode}",
-        }
+        return error_result(
+            "INTERNAL_ERROR",
+            (proc.stderr or "").strip() or f"rg exited {proc.returncode}",
+            workspace_id=workspace_id,
+            extra={"query": q, "path": path or ".", "exit_code": proc.returncode},
+        )
 
     raw_matches: list[dict[str, Any]] = []
     contexts: dict[str, dict[int, str]] = {}

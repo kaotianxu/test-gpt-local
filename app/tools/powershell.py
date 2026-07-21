@@ -388,6 +388,7 @@ def register_tools(mcp: FastMCP) -> None:
             {
                 "workspace_id": workspace_id,
                 "script_sha256": hashlib.sha256(script.encode("utf-8")).hexdigest(),
+                "working_directory": working_directory,
                 "timeout_seconds": timeout_seconds,
                 "wait": wait,
             },

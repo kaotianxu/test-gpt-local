@@ -10,6 +10,7 @@ from mcp.types import ToolAnnotations
 
 from app.config import load_projects_config
 from app.services.envelope import ok_result
+from app.tools.capabilities import SERVER_VERSION
 
 
 def register_tools(mcp: FastMCP) -> None:
@@ -31,7 +32,7 @@ def register_tools(mcp: FastMCP) -> None:
             {
                 "status": "ok",
                 "service": "gpt-local-code-operator",
-                "version": "0.2.0",
+                "version": SERVER_VERSION,
             }
         )
 
