@@ -157,6 +157,8 @@ def _run_check(
             timeout_seconds=timeout,
             env=check_env,
             tool_name=f"run_check:{check_id}",
+            concurrency_write=False,
+            priority=10,
         )
     except RuntimeError as exc:
         return error_result(
@@ -167,7 +169,16 @@ def _run_check(
 
     # ---- 5. Wait (if requested) ----
     if wait:
-        terminal_statuses = {"passed", "failed", "timed_out", "cancelled"}
+        terminal_statuses = {
+            "passed",
+            "failed",
+            "timed_out",
+            "cancelled",
+            "resource_exhausted",
+            "interrupted",
+            "lost",
+            "recovery_required",
+        }
         deadline = time.monotonic() + timeout + 5
         while time.monotonic() < deadline:
             result = pm.get_result(process_id)

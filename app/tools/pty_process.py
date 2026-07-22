@@ -156,7 +156,16 @@ def _run_command(
     # ---- 5. Wait (if requested) ----
     if wait:
         # Poll until the status changes from "running"/"queued".
-        terminal_statuses = {"passed", "failed", "timed_out", "cancelled"}
+        terminal_statuses = {
+            "passed",
+            "failed",
+            "timed_out",
+            "cancelled",
+            "resource_exhausted",
+            "interrupted",
+            "lost",
+            "recovery_required",
+        }
         deadline = time.monotonic() + timeout + 5
         while time.monotonic() < deadline:
             result = pm.get_result(process_id)

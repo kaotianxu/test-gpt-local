@@ -145,6 +145,11 @@ def init_db(db_path: str | Path | None = None) -> None:
             completed_at     TEXT,
             stdout_path      TEXT,
             stderr_path      TEXT,
+            process_creation_identity TEXT,
+            heartbeat        TEXT,
+            last_output_offset INTEGER NOT NULL DEFAULT 0,
+            job_object_identity TEXT,
+            recovery_status  TEXT,
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id)
         );
 
@@ -235,6 +240,20 @@ def init_db(db_path: str | Path | None = None) -> None:
         conn.execute("ALTER TABLE workspaces ADD COLUMN last_check TEXT")
     if "changed_files" not in workspace_columns:
         conn.execute("ALTER TABLE workspaces ADD COLUMN changed_files TEXT")
+
+    process_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(processes)").fetchall()
+    }
+    process_migrations = {
+        "process_creation_identity": "TEXT",
+        "heartbeat": "TEXT",
+        "last_output_offset": "INTEGER NOT NULL DEFAULT 0",
+        "job_object_identity": "TEXT",
+        "recovery_status": "TEXT",
+    }
+    for column, column_type in process_migrations.items():
+        if column not in process_columns:
+            conn.execute(f"ALTER TABLE processes ADD COLUMN {column} {column_type}")
 
     operation_columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(operations)").fetchall()
@@ -513,6 +532,43 @@ def update_process_status(
     set_clause = ", ".join(f"{k} = ?" for k in fields)
     values = list(fields.values()) + [process_id]
     conn.execute(f"UPDATE processes SET {set_clause} WHERE process_id = ?", values)
+    conn.commit()
+
+
+def update_process_runtime(
+    process_id: str,
+    *,
+    pid: int | None = None,
+    process_creation_identity: str | None = None,
+    heartbeat: str | None = None,
+    last_output_offset: int | None = None,
+    job_object_identity: str | None = None,
+    recovery_status: str | None = None,
+) -> None:
+    """Update persisted runtime identity and recovery metadata."""
+    fields: dict[str, object] = {}
+    if pid is not None:
+        fields["pid"] = pid
+    if process_creation_identity is not None:
+        fields["process_creation_identity"] = process_creation_identity
+    if heartbeat is not None:
+        fields["heartbeat"] = heartbeat
+    if last_output_offset is not None:
+        if last_output_offset < 0:
+            raise ValueError("last_output_offset must not be negative")
+        fields["last_output_offset"] = last_output_offset
+    if job_object_identity is not None:
+        fields["job_object_identity"] = job_object_identity
+    if recovery_status is not None:
+        fields["recovery_status"] = recovery_status
+    if not fields:
+        return
+    conn = _get_connection()
+    set_clause = ", ".join(f"{key} = ?" for key in fields)
+    conn.execute(
+        f"UPDATE processes SET {set_clause} WHERE process_id = ?",
+        [*fields.values(), process_id],
+    )
     conn.commit()
 
 

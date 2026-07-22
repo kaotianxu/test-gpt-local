@@ -3,6 +3,7 @@
 Starts a FastMCP server with Streamable HTTP transport on 127.0.0.1:8765.
 """
 
+import atexit
 import logging
 from pathlib import Path
 from typing import cast
@@ -17,6 +18,7 @@ from app.config import (
     load_operator_config,
 )
 from app.services.process_manager import ProcessManager
+from app.services.process_recovery import recover_processes
 from app.services.tool_registry import RegisteredToolMCP
 from app.storage import database as db
 from app.storage.database import Database
@@ -68,10 +70,18 @@ def create_app() -> FastMCP:
     database = Database(data_dir / "operator.db")
     # Tools share an explicitly app-scoped manager; independently constructed
     # managers (notably tests) remain isolated from this singleton.
-    ProcessManager.configure_instance(ProcessManager(database=database))
-    orphaned = database.interrupt_incomplete_processes()
-    if orphaned:
-        log.warning("marked %d orphaned process record(s) as interrupted", orphaned)
+    process_manager = ProcessManager(database=database)
+    ProcessManager.configure_instance(process_manager)
+    atexit.register(process_manager.shutdown)
+    recovery = recover_processes(database, process_manager)
+    if any(recovery[key] for key in ("recovered", "interrupted", "lost", "recovery_required")):
+        log.warning(
+            "process recovery: recovered=%d interrupted=%d lost=%d recovery_required=%d",
+            recovery["recovered"],
+            recovery["interrupted"],
+            recovery["lost"],
+            recovery["recovery_required"],
+        )
 
     # ---- Configure logging ----
     log_cfg = get_logging_config()

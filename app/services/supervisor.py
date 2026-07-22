@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 
 from app.config import BASE_DIR, get_project, load_operator_config
 from app.services.logging_config import configure_component_logger
+from app.services.process_recovery import recover_processes
 from app.services.service_state import (
     ServiceLock,
     ServiceStateStore,
@@ -549,7 +550,8 @@ def reconcile_runtime_state(config: dict[str, Any] | None = None) -> dict[str, A
     db.init_db(BASE_DIR / "data" / "operator.db")
     incomplete = db.list_incomplete_processes()
     interrupted_workspaces = {str(item["workspace_id"]) for item in incomplete}
-    interrupted = db.interrupt_incomplete_processes()
+    process_recovery = recover_processes(db)
+    interrupted = int(process_recovery["interrupted"])
     workspace_results: list[dict[str, Any]] = []
     cleanup = cfg["service"]["cleanup"]
     ttl = timedelta(hours=float(cfg["workspace"]["ttl_hours"]))
@@ -609,6 +611,7 @@ def reconcile_runtime_state(config: dict[str, Any] | None = None) -> dict[str, A
 
     return {
         "interrupted_processes": interrupted,
+        "process_recovery": process_recovery,
         "workspaces": workspace_results,
     }
 

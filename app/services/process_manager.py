@@ -34,6 +34,19 @@ from app.config import (
     get_process_config,
     get_proxy_config,
 )
+from app.services.process_recovery import pid_alive, process_creation_identity
+from app.services.process_resources import (
+    ProcessResourceController,
+    ProcessResourceHandle,
+)
+from app.services.process_scheduler import (
+    ConcurrencyKey,
+    ProcessLease,
+    ProcessScheduler,
+    QueuePolicy,
+    QueueTimeoutError,
+    ResourceLimits,
+)
 from app.storage import database as db
 from app.storage.database import Database
 
@@ -102,7 +115,9 @@ class _RunningProcess:
         pty_output_handle: Any = None,
         pty_reader_thread: threading.Thread | None = None,
         stdin_pipe: Any = None,
-        slot_released: bool = False,
+        lease: ProcessLease | None = None,
+        creation_identity: str | None = None,
+        resource_handle: ProcessResourceHandle | None = None,
     ) -> None:
         self.process_id = process_id
         self.workspace_id = workspace_id
@@ -116,9 +131,12 @@ class _RunningProcess:
         self.pty_output_handle = pty_output_handle
         self.pty_reader_thread = pty_reader_thread
         self.stdin_pipe = stdin_pipe  # subprocess stdin pipe (non-PTY mode)
+        self.lease = lease
+        self.creation_identity = creation_identity
+        self.resource_handle = resource_handle
         self._lock = threading.RLock()
         self._completed = threading.Event()
-        self._slot_released = slot_released
+        self._finalized = False
 
     def wait(self, timeout: float | None = None) -> bool:
         """Block until the process finishes, or until *timeout* seconds.
@@ -132,8 +150,16 @@ class _RunningProcess:
         except subprocess.TimeoutExpired:
             return False
 
+    def claim_completion(self) -> bool:
+        """Claim exclusive ownership of terminal-state cleanup."""
+        with self._lock:
+            if self._finalized:
+                return False
+            self._finalized = True
+            return True
+
     def mark_done(self) -> None:
-        """Called by the watchdog when the process has finished."""
+        """Mark process completion for waiters."""
         self._completed.set()
 
     def write_stdin(self, text: str, append_newline: bool = True) -> None:
@@ -206,12 +232,11 @@ class _RunningProcess:
                 log.warning("send_interrupt fallback failed for process %s", self.process_id)
 
     def release_slot(self) -> bool:
-        """Mark the process slot as released exactly once."""
+        """Release the scheduler lease exactly once."""
         with self._lock:
-            if self._slot_released:
-                return False
-            self._slot_released = True
-            return True
+            lease = self.lease
+            self.lease = None
+        return lease.release() if lease is not None else False
 
 
 class ProcessManager:
@@ -230,6 +255,8 @@ class ProcessManager:
         config: Mapping[str, Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
         processes_dir: Path | None = None,
+        scheduler: ProcessScheduler | None = None,
+        resource_controller: ProcessResourceController | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._database: Any = database if database is not None else db
@@ -245,7 +272,31 @@ class ProcessManager:
         self._default_timeout = int(cfg.get("default_timeout_seconds", 600))
         self._max_timeout = int(cfg.get("max_timeout_seconds", 3600))
         self._register_artifacts = bool(cfg.get("register_artifacts", True))
-        self._slots = threading.BoundedSemaphore(self._max_running)
+        per_workspace = int(cfg.get("max_running_jobs_per_workspace", self._max_running))
+        per_workspace = max(1, min(per_workspace, self._max_running))
+        self._queue_timeout = float(cfg.get("queue_timeout_seconds", 0.0))
+        self._heartbeat_interval = max(
+            0.1, float(cfg.get("heartbeat_interval_seconds", 2.0))
+        )
+        self._scheduler = scheduler or ProcessScheduler(
+            QueuePolicy(
+                global_limit=self._max_running,
+                per_workspace_limit=per_workspace,
+                queue_timeout_seconds=self._queue_timeout,
+            ),
+            clock=clock,
+        )
+        self._resource_limits = ResourceLimits(
+            cpu_time_seconds=_optional_positive_int(cfg.get("cpu_time_seconds")),
+            memory_bytes=_optional_positive_int(cfg.get("memory_bytes")),
+            max_processes=_optional_positive_int(cfg.get("max_processes")),
+            max_output_bytes=_optional_positive_int(
+                cfg.get("max_output_bytes", self._max_output_chars * 4)
+            ),
+            max_disk_bytes=_optional_positive_int(cfg.get("max_disk_bytes")),
+        )
+        self._resource_controller = resource_controller or ProcessResourceController()
+        self._shutting_down = False
 
     # ---- Public API --------------------------------------------------------
 
@@ -279,6 +330,8 @@ class ProcessManager:
         timeout_seconds: int | None = None,
         env: dict[str, str] | None = None,
         tool_name: str = "run_pwsh",
+        concurrency_write: bool = True,
+        priority: int = 0,
     ) -> dict[str, Any]:
         """Execute a PowerShell script via stdin and return the process result.
 
@@ -295,11 +348,11 @@ class ProcessManager:
             self._max_timeout,
         )
 
-        if not self._slots.acquire(blocking=False):
-            raise RuntimeError(
-                f"Maximum concurrent jobs ({self._max_running}) already running. "
-                "Wait for a running job to complete or cancel it."
-            )
+        lease = self._acquire_lease(
+            workspace_id,
+            write=concurrency_write,
+            priority=priority,
+        )
 
         # ---- generate process id ----
         process_id = "pr-" + secrets.token_hex(4)
@@ -332,7 +385,6 @@ class ProcessManager:
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
         )
-        self._database.update_process_status(process_id, "running")
 
         # ---- spawn subprocess ----
         try:
@@ -341,7 +393,7 @@ class ProcessManager:
         except OSError as exc:
             self._database.update_process_status(process_id, "failed", exit_code=-1)
             self._database.complete_operation(process_id)
-            self._slots.release()
+            lease.release()
             return {
                 "error": f"cannot open output files: {exc}",
                 "process_id": process_id,
@@ -378,7 +430,7 @@ class ProcessManager:
             stdout_file.close()
             stderr_file.close()
             self._database.update_process_status(process_id, "failed", exit_code=-1)
-            self._slots.release()
+            lease.release()
             return {
                 "error": f"pwsh executable not found: {pwsh_path}",
                 "process_id": process_id,
@@ -387,11 +439,32 @@ class ProcessManager:
             stdout_file.close()
             stderr_file.close()
             self._database.update_process_status(process_id, "failed", exit_code=-1)
-            self._slots.release()
+            lease.release()
             return {
                 "error": f"cannot start pwsh: {exc}",
                 "process_id": process_id,
             }
+
+        creation_identity = process_creation_identity(proc.pid)
+        resource_handle = self._resource_controller.attach(
+            process_id=process_id,
+            pid=proc.pid,
+            process=proc,
+            limits=self._resource_limits,
+        )
+        self._database.update_process_status(process_id, "running", pid=proc.pid)
+        self._database.update_process_runtime(
+            process_id,
+            pid=proc.pid,
+            process_creation_identity=creation_identity,
+            heartbeat=_now_iso(),
+            job_object_identity=resource_handle.identity,
+            recovery_status=(
+                f"resource_limits_unavailable:{resource_handle.error}"
+                if resource_handle.error
+                else "started"
+            ),
+        )
 
         # Write script to stdin and close pipe so pwsh can start processing.
         try:
@@ -410,6 +483,9 @@ class ProcessManager:
             stderr_path=stderr_path,
             working_directory=cwd,
             deadline=deadline,
+            lease=lease,
+            creation_identity=creation_identity,
+            resource_handle=resource_handle,
         )
 
         with self._lock:
@@ -479,6 +555,15 @@ class ProcessManager:
                 "info": "process is not running",
             }
 
+        if not rp.claim_completion():
+            record = self._database.get_process(process_id)
+            return {
+                "status": record["status"] if record else "unknown",
+                "process_id": process_id,
+                "process_tree_terminated": False,
+                "info": "process completion is already being handled",
+            }
+
         pid = rp.proc.pid
         tree_killed = self._kill_tree(pid)
 
@@ -497,8 +582,7 @@ class ProcessManager:
         rp.mark_done()
         with self._lock:
             self._running.pop(process_id, None)
-        if rp.release_slot():
-            self._slots.release()
+        rp.release_slot()
 
         # Clean up PTY handles.
         self._cleanup_pty(rp)
@@ -518,6 +602,99 @@ class ProcessManager:
             ]
         for pid in to_cancel:
             self.cancel(pid)
+
+    def shutdown(
+        self,
+        *,
+        grace_seconds: float = 2.0,
+        terminate_seconds: float = 2.0,
+    ) -> dict[str, int]:
+        """Drain managed processes with interrupt, terminate, then force-kill."""
+        if grace_seconds < 0 or terminate_seconds < 0:
+            raise ValueError("shutdown grace periods must not be negative")
+
+        with self._lock:
+            if self._shutting_down:
+                return {"interrupted": 0, "terminated": 0, "killed": 0, "total": 0}
+            self._shutting_down = True
+            processes = [rp for rp in self._running.values() if rp.claim_completion()]
+
+        if not processes:
+            return {"interrupted": 0, "terminated": 0, "killed": 0, "total": 0}
+
+        stages = {rp.process_id: "service_shutdown_interrupt" for rp in processes}
+        for rp in processes:
+            self._database.update_process_runtime(
+                rp.process_id,
+                heartbeat=_now_iso(),
+                recovery_status="service_shutdown_interrupt_sent",
+            )
+            try:
+                rp.send_interrupt()
+            except Exception:
+                log.exception("shutdown interrupt failed for %s", rp.process_id)
+
+        remaining = self._wait_for_shutdown(processes, grace_seconds)
+        for rp in remaining:
+            stages[rp.process_id] = "service_shutdown_terminate"
+            try:
+                rp.proc.terminate()
+            except (OSError, AttributeError):
+                pass
+
+        remaining = self._wait_for_shutdown(remaining, terminate_seconds)
+        for rp in remaining:
+            stages[rp.process_id] = "service_shutdown_kill"
+            self._kill_tree(rp.proc.pid)
+
+        for rp in processes:
+            exit_code = rp.proc.poll()
+            self._database.update_process_status(
+                rp.process_id,
+                status="interrupted",
+                exit_code=exit_code if exit_code is not None else -1,
+                completed_at=_now_iso(),
+            )
+            self._database.update_process_runtime(
+                rp.process_id,
+                heartbeat=_now_iso(),
+                last_output_offset=self._resource_limits.output_usage(
+                    (rp.stdout_path, rp.stderr_path)
+                ),
+                recovery_status=stages[rp.process_id],
+            )
+            rp.mark_done()
+            with self._lock:
+                self._running.pop(rp.process_id, None)
+            rp.release_slot()
+            self._cleanup_pty(rp)
+            self._register_process_artifacts(rp)
+
+        interrupted = sum(
+            stage == "service_shutdown_interrupt" for stage in stages.values()
+        )
+        terminated = sum(
+            stage == "service_shutdown_terminate" for stage in stages.values()
+        )
+        killed = sum(stage == "service_shutdown_kill" for stage in stages.values())
+        return {
+            "interrupted": interrupted,
+            "terminated": terminated,
+            "killed": killed,
+            "total": len(processes),
+        }
+
+    @staticmethod
+    def _wait_for_shutdown(
+        processes: list[_RunningProcess], timeout_seconds: float
+    ) -> list[_RunningProcess]:
+        deadline = time.monotonic() + timeout_seconds
+        remaining = list(processes)
+        while remaining and time.monotonic() < deadline:
+            remaining = [rp for rp in remaining if rp.proc.poll() is None]
+            if remaining:
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        return [rp for rp in remaining if rp.proc.poll() is None]
 
     def delete_outputs_for_workspace(self, workspace_id: str) -> int:
         """Delete controlled process-output directories for a workspace."""
@@ -570,13 +747,9 @@ class ProcessManager:
             self._max_timeout,
         )
 
-        if not self._slots.acquire(blocking=False):
-            raise RuntimeError(
-                f"Maximum concurrent jobs ({self._max_running}) already running. "
-                "Wait for a running job to complete or cancel it."
-            )
+        lease = self._acquire_lease(workspace_id, write=True, priority=0)
         if not 20 <= columns <= 500 or not 5 <= rows <= 200:
-            self._slots.release()
+            lease.release()
             return {"error": "terminal dimensions must be columns 20-500 and rows 5-200"}
 
         # ---- generate process id ----
@@ -612,7 +785,6 @@ class ProcessManager:
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
         )
-        self._database.update_process_status(process_id, "running")
 
         # ---- Build the command line ----
         cmd_parts = self._build_command_line(shell, command)
@@ -633,7 +805,7 @@ class ProcessManager:
         use_conpty = tty and _has_conpty()
         if tty and os.name == "nt" and not use_conpty:
             self._database.update_process_status(process_id, "failed", exit_code=-1)
-            self._slots.release()
+            lease.release()
             return {
                 "error": "ConPTY is unavailable on this Windows host",
                 "code": "PTY_UNAVAILABLE",
@@ -708,7 +880,7 @@ class ProcessManager:
                     except Exception:
                         pass
                 self._database.update_process_status(process_id, "failed", exit_code=-1)
-                self._slots.release()
+                lease.release()
                 return {
                     "error": f"ConPTY creation failed: {exc}",
                     "code": "PTY_CREATE_FAILED",
@@ -722,7 +894,7 @@ class ProcessManager:
                 stderr_file = open(stderr_path, "w", encoding="utf-8")
             except OSError as exc:
                 self._database.update_process_status(process_id, "failed", exit_code=-1)
-                self._slots.release()
+                lease.release()
                 return {
                     "error": f"cannot open output files: {exc}",
                     "process_id": process_id,
@@ -751,7 +923,7 @@ class ProcessManager:
                 stdout_file.close()
                 stderr_file.close()
                 self._database.update_process_status(process_id, "failed", exit_code=-1)
-                self._slots.release()
+                lease.release()
                 return {
                     "error": f"executable not found: {cmd_parts[0] if cmd_parts else command}",
                     "process_id": process_id,
@@ -760,10 +932,33 @@ class ProcessManager:
                 stdout_file.close()
                 stderr_file.close()
                 self._database.update_process_status(process_id, "failed", exit_code=-1)
+                lease.release()
                 return {
                     "error": f"cannot start process: {exc}",
                     "process_id": process_id,
                 }
+
+        actual_pid = proc.pid if hasattr(proc, "pid") else pid
+        creation_identity = process_creation_identity(actual_pid)
+        resource_handle = self._resource_controller.attach(
+            process_id=process_id,
+            pid=actual_pid,
+            process=proc,
+            limits=self._resource_limits,
+        )
+        self._database.update_process_status(process_id, "running", pid=actual_pid)
+        self._database.update_process_runtime(
+            process_id,
+            pid=actual_pid,
+            process_creation_identity=creation_identity,
+            heartbeat=_now_iso(),
+            job_object_identity=resource_handle.identity,
+            recovery_status=(
+                f"resource_limits_unavailable:{resource_handle.error}"
+                if resource_handle.error
+                else "started"
+            ),
+        )
 
         deadline = self._clock() + timeout
         rp = _RunningProcess(
@@ -779,6 +974,9 @@ class ProcessManager:
             pty_output_handle=pty_output_read,
             pty_reader_thread=pty_reader_thread,
             stdin_pipe=stdin_pipe,
+            lease=lease,
+            creation_identity=creation_identity,
+            resource_handle=resource_handle,
         )
 
         with self._lock:
@@ -794,7 +992,7 @@ class ProcessManager:
         return {
             "process_id": process_id,
             "status": "running",
-            "pid": proc.pid if hasattr(proc, "pid") else pid,
+            "pid": actual_pid,
             "started_at": _now_iso(),
             "tty": use_conpty,
             "pty": use_conpty,
@@ -970,6 +1168,83 @@ class ProcessManager:
             candidate.mkdir(parents=True, exist_ok=True)
         return candidate
 
+    def _acquire_lease(
+        self,
+        workspace_id: str,
+        *,
+        write: bool,
+        priority: int,
+    ) -> ProcessLease:
+        """Acquire a fair scheduler lease for one workspace process."""
+        with self._lock:
+            if self._shutting_down:
+                raise RuntimeError("Process manager is shutting down; new jobs are not accepted")
+        try:
+            return self._scheduler.acquire(
+                workspace_id,
+                key=ConcurrencyKey.workspace(workspace_id, write=write),
+                priority=priority,
+                timeout_seconds=self._queue_timeout,
+            )
+        except QueueTimeoutError as exc:
+            raise RuntimeError(
+                f"Maximum concurrent jobs ({self._max_running}) or workspace lock "
+                f"unavailable: {exc}"
+            ) from exc
+
+    def scheduler_snapshot(self) -> dict[str, Any]:
+        """Return current process admission diagnostics."""
+        return self._scheduler.snapshot()
+
+    def adopt_recovered_process(self, record: Mapping[str, Any]) -> bool:
+        """Resume monitoring a process whose PID identity survived restart."""
+        process_id = str(record.get("process_id", ""))
+        workspace_id = str(record.get("workspace_id", ""))
+        raw_pid = record.get("pid")
+        pid = int(raw_pid) if isinstance(raw_pid, int) else 0
+        expected_identity = str(record.get("process_creation_identity") or "")
+        if (
+            not _PROCESS_ID_RE.match(process_id)
+            or not workspace_id
+            or pid <= 0
+            or not expected_identity
+            or not pid_alive(pid)
+            or process_creation_identity(pid) != expected_identity
+        ):
+            return False
+        try:
+            lease = self._scheduler.acquire(
+                workspace_id,
+                key=ConcurrencyKey.workspace(workspace_id, write=True),
+                priority=100,
+                timeout_seconds=0,
+            )
+        except QueueTimeoutError:
+            return False
+
+        stdout_path = Path(str(record.get("stdout_path") or ""))
+        stderr_path = Path(str(record.get("stderr_path") or ""))
+        working_directory = Path(str(record.get("working_directory") or "."))
+        recovered = _RecoveredProcess(pid=pid, creation_identity=expected_identity)
+        running = _RunningProcess(
+            process_id=process_id,
+            workspace_id=workspace_id,
+            proc=recovered,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            working_directory=working_directory,
+            deadline=self._clock() + self._default_timeout,
+            lease=lease,
+            creation_identity=expected_identity,
+        )
+        with self._lock:
+            if process_id in self._running:
+                lease.release()
+                return True
+            self._running[process_id] = running
+        threading.Thread(target=self._watchdog, args=(running,), daemon=True).start()
+        return True
+
     def _get_running(self, process_id: str) -> _RunningProcess | None:
         """Return the running-process record, or None."""
         with self._lock:
@@ -987,6 +1262,8 @@ class ProcessManager:
         exit_code: int,
     ) -> None:
         """Record process completion and remove from the running table."""
+        if not rp.claim_completion():
+            return
         now = _now_iso()
         status = "passed" if exit_code == 0 else "failed"
         record = self._database.get_process(rp.process_id)
@@ -1002,8 +1279,7 @@ class ProcessManager:
         rp.mark_done()
         with self._lock:
             self._running.pop(rp.process_id, None)
-        if rp.release_slot():
-            self._slots.release()
+        rp.release_slot()
 
         # Clean up PTY handles.
         self._cleanup_pty(rp)
@@ -1042,43 +1318,88 @@ class ProcessManager:
             log.exception("failed to record git-status audit for %s", rp.process_id)
 
     def _watchdog(self, rp: _RunningProcess) -> None:
-        """Background thread: wait for process exit or timeout."""
-        remaining = rp.deadline - self._clock()
-        if remaining > 0:
-            exited = rp.wait(timeout=remaining)
-        else:
-            exited = False
+        """Monitor exit, timeout, heartbeat, and resource ceilings."""
+        while True:
+            remaining = rp.deadline - self._clock()
+            if remaining <= 0:
+                log.warning(
+                    "watchdog: process %s timed out, killing tree (pid=%d)",
+                    rp.process_id,
+                    rp.proc.pid,
+                )
+                self._terminate_running(rp, "timed_out", "wall_clock_timeout")
+                return
 
-        if not exited:
-            # Timeout: kill the process tree.
-            log.warning(
-                "watchdog: process %s timed out, killing tree (pid=%d)",
-                rp.process_id,
-                rp.proc.pid,
+            wait_slice = min(remaining, self._heartbeat_interval)
+            if rp.wait(timeout=wait_slice):
+                exit_code = rp.proc.poll()
+                if exit_code is not None:
+                    self._finalize(rp, exit_code)
+                    return
+
+            violation = self._resource_violation(rp)
+            output_offset = self._resource_limits.output_usage(
+                (rp.stdout_path, rp.stderr_path)
             )
-            self._kill_tree(rp.proc.pid)
-            try:
-                rp.proc.terminate()
-            except OSError:
-                pass
-            self._database.update_process_status(
+            self._database.update_process_runtime(
                 rp.process_id,
-                status="timed_out",
-                exit_code=-1,
-                completed_at=_now_iso(),
+                heartbeat=_now_iso(),
+                last_output_offset=output_offset,
+                recovery_status="monitoring" if violation is None else violation,
             )
-            rp.mark_done()
-            with self._lock:
-                self._running.pop(rp.process_id, None)
-            if rp.release_slot():
-                self._slots.release()
-            self._cleanup_pty(rp)
-            self._register_process_artifacts(rp)
+            if violation is not None:
+                log.warning(
+                    "watchdog: process %s exceeded %s, killing tree (pid=%d)",
+                    rp.process_id,
+                    violation,
+                    rp.proc.pid,
+                )
+                self._terminate_running(rp, "resource_exhausted", violation)
+                return
+
+    def _resource_violation(self, rp: _RunningProcess) -> str | None:
+        if self._resource_limits.output_limit_exceeded(
+            (rp.stdout_path, rp.stderr_path)
+        ):
+            return "output_limit_exceeded"
+        disk_limit = self._resource_limits.max_disk_bytes
+        if disk_limit is not None and _directory_size(rp.working_directory) > disk_limit:
+            return "disk_limit_exceeded"
+        return None
+
+    def _terminate_running(
+        self,
+        rp: _RunningProcess,
+        status: str,
+        recovery_status: str,
+    ) -> None:
+        if not rp.claim_completion():
             return
-
-        exit_code = rp.proc.poll()
-        if exit_code is not None:
-            self._finalize(rp, exit_code)
+        self._kill_tree(rp.proc.pid)
+        try:
+            rp.proc.terminate()
+        except OSError:
+            pass
+        self._database.update_process_status(
+            rp.process_id,
+            status=status,
+            exit_code=-1,
+            completed_at=_now_iso(),
+        )
+        self._database.update_process_runtime(
+            rp.process_id,
+            heartbeat=_now_iso(),
+            last_output_offset=self._resource_limits.output_usage(
+                (rp.stdout_path, rp.stderr_path)
+            ),
+            recovery_status=recovery_status,
+        )
+        rp.mark_done()
+        with self._lock:
+            self._running.pop(rp.process_id, None)
+        rp.release_slot()
+        self._cleanup_pty(rp)
+        self._register_process_artifacts(rp)
 
     def _kill_tree(self, pid: int) -> bool:
         """Kill a process and its descendants without touching unrelated PIDs."""
@@ -1149,6 +1470,11 @@ class ProcessManager:
                 pass
             rp.stdin_pipe = None
 
+        resource_handle = rp.resource_handle
+        rp.resource_handle = None
+        if resource_handle is not None:
+            resource_handle.close()
+
     def _register_process_artifacts(self, rp: _RunningProcess) -> None:
         """Discover workspace outputs and retain complete process logs."""
         if not self._register_artifacts:
@@ -1214,6 +1540,41 @@ class ProcessManager:
 
 # ---- Module-level helpers -------------------------------------------------
 
+class _RecoveredProcess:
+    """Popen-like monitor for a process adopted after service restart."""
+
+    def __init__(self, *, pid: int, creation_identity: str) -> None:
+        self.pid = pid
+        self.creation_identity = creation_identity
+        self.returncode: int | None = None
+        self.stdin: Any = None
+
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        if (
+            not pid_alive(self.pid)
+            or process_creation_identity(self.pid) != self.creation_identity
+        ):
+            self.returncode = -1
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        deadline = time.monotonic() + (timeout if timeout is not None else 30.0)
+        while time.monotonic() < deadline:
+            result = self.poll()
+            if result is not None:
+                return result
+            time.sleep(0.05)
+        return None
+
+    def terminate(self) -> None:
+        try:
+            os.kill(self.pid, getattr(signal, "SIGTERM"))
+        except (OSError, ProcessLookupError):
+            pass
+
+
 # Minimal pseudo-process wrapper for ConPTY mode.
 class _PseudoProcess:
     """Minimal duck-typed replacement for ``subprocess.Popen``.
@@ -1277,6 +1638,28 @@ class _PseudoProcess:
             kernel32.TerminateProcess(wintypes.HANDLE(self._handle), 1)
         except Exception:
             pass
+
+
+def _optional_positive_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    parsed = int(value)
+    return parsed if parsed > 0 else None
+
+
+def _directory_size(root: Path) -> int:
+    total = 0
+    try:
+        paths = root.rglob("*")
+    except OSError:
+        return 0
+    for path in paths:
+        try:
+            if path.is_file() and not path.is_symlink():
+                total += path.stat().st_size
+        except OSError:
+            continue
+    return total
 
 
 def _now_iso() -> str:

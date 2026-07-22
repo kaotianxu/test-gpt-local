@@ -51,10 +51,18 @@ def load_operator_config(path: Path | None = None) -> dict[str, Any]:
     # --- process defaults ---
     proc = cfg.setdefault("process", {})
     proc.setdefault("max_running_jobs", 3)
+    proc.setdefault("max_running_jobs_per_workspace", 2)
+    proc.setdefault("queue_timeout_seconds", 0.0)
+    proc.setdefault("heartbeat_interval_seconds", 2.0)
     proc.setdefault("default_timeout_seconds", 600)
     proc.setdefault("max_timeout_seconds", 3600)
     proc.setdefault("max_output_chars", 200000)
     proc.setdefault("output_tail_chars", 50000)
+    proc.setdefault("cpu_time_seconds", 0)
+    proc.setdefault("memory_bytes", 0)
+    proc.setdefault("max_processes", 0)
+    proc.setdefault("max_output_bytes", 20_971_520)
+    proc.setdefault("max_disk_bytes", 0)
 
     # --- files defaults ---
     files = cfg.setdefault("files", {})
@@ -113,6 +121,34 @@ def _validate_operator_config(cfg: dict[str, Any]) -> None:
         parsed = urlparse(str(proxy.get("url", "")))
         if parsed.scheme not in {"http", "https"} or not parsed.hostname or not parsed.port:
             raise ValueError("proxy.url must be an HTTP(S) URL with an explicit port")
+
+    process = cfg["process"]
+    global_limit = int(process["max_running_jobs"])
+    workspace_limit = int(process["max_running_jobs_per_workspace"])
+    if global_limit < 1:
+        raise ValueError("process.max_running_jobs must be at least 1")
+    if not 1 <= workspace_limit <= global_limit:
+        raise ValueError(
+            "process.max_running_jobs_per_workspace must be between 1 and the global limit"
+        )
+    if float(process["queue_timeout_seconds"]) < 0:
+        raise ValueError("process.queue_timeout_seconds must not be negative")
+    if float(process["heartbeat_interval_seconds"]) <= 0:
+        raise ValueError("process.heartbeat_interval_seconds must be positive")
+    if int(process["default_timeout_seconds"]) <= 0:
+        raise ValueError("process.default_timeout_seconds must be positive")
+    if int(process["max_timeout_seconds"]) < int(process["default_timeout_seconds"]):
+        raise ValueError("process.max_timeout_seconds must not be below the default timeout")
+    for key in (
+        "max_output_chars",
+        "output_tail_chars",
+        "max_output_bytes",
+    ):
+        if int(process[key]) <= 0:
+            raise ValueError(f"process.{key} must be positive")
+    for key in ("cpu_time_seconds", "memory_bytes", "max_processes", "max_disk_bytes"):
+        if int(process[key]) < 0:
+            raise ValueError(f"process.{key} must not be negative")
 
     service = cfg["service"]
     for key in (

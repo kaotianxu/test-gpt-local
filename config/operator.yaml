@@ -18,10 +18,18 @@ workspace:
 
 process:
   max_running_jobs: 3
+  max_running_jobs_per_workspace: 2
+  queue_timeout_seconds: 0
+  heartbeat_interval_seconds: 2
   default_timeout_seconds: 600
   max_timeout_seconds: 3600
   max_output_chars: 200000
   output_tail_chars: 50000
+  cpu_time_seconds: 0
+  memory_bytes: 0
+  max_processes: 0
+  max_output_bytes: 20971520
+  max_disk_bytes: 0
 
 files:
   max_read_chars: 100000
