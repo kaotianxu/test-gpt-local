@@ -59,6 +59,14 @@ class TestBuildEnv:
         env = pm._build_env({"PYTHONDONTWRITEBYTECODE": "1"})
         assert env["PYTHONDONTWRITEBYTECODE"] == "1"
 
+    def test_forces_python_subprocess_output_to_utf8(self) -> None:
+        pm = ProcessManager()
+        env = pm._build_env(
+            {"PYTHONUTF8": "0", "PYTHONIOENCODING": "cp936"}
+        )
+        assert env["PYTHONUTF8"] == "1"
+        assert env["PYTHONIOENCODING"] == "utf-8"
+
     def test_does_not_override_existing_env(self) -> None:
         """If the env already has HTTP_PROXY set, _build_env should not override it."""
         pm = ProcessManager()
@@ -122,3 +130,8 @@ class TestPwshPrefix:
 
     def test_prefix_sets_error_action_preference(self) -> None:
         assert "PSNativeCommandUseErrorActionPreference" in _PWSH_PREFIX
+
+    def test_prefix_forces_utf8_process_output(self) -> None:
+        assert "[Console]::OutputEncoding" in _PWSH_PREFIX
+        assert "[System.Text.UTF8Encoding]::new($false)" in _PWSH_PREFIX
+        assert "$OutputEncoding = [Console]::OutputEncoding" in _PWSH_PREFIX

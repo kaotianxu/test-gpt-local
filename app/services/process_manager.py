@@ -64,7 +64,13 @@ _PROCESS_GONE = -1
 # Default PowerShell prefix injected before every script so that common
 # interactive nuisances are suppressed.
 _PWSH_PREFIX = (
-    "$ProgressPreference = 'SilentlyContinue'\n$PSNativeCommandUseErrorActionPreference = $true\n"
+    "$ProgressPreference = 'SilentlyContinue'\n"
+    "$PSNativeCommandUseErrorActionPreference = $true\n"
+    # stdout/stderr are inherited file handles, so Python's Popen encoding
+    # does not transcode what PowerShell writes to them.  Pin the console
+    # encoding to UTF-8 instead of inheriting the Windows OEM code page.
+    "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
+    "$OutputEncoding = [Console]::OutputEncoding\n"
 )
 
 # ---------------------------------------------------------------------------
@@ -229,19 +235,24 @@ class _RunningProcess:
                 ConPTYWrapper.send_interrupt(self.pty_handle)
                 return
 
-        # Pipe mode: send Ctrl+C via the Windows console event.
-        try:
-            import ctypes
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            if not kernel32.GenerateConsoleCtrlEvent(0, 0):
-                log.warning("GenerateConsoleCtrlEvent failed for process %s", self.process_id)
-        except Exception:
-            # POSIX fallback is useful for development and test runners.
+        if os.name == "nt":
+            # Pipe-mode children are launched with CREATE_NEW_PROCESS_GROUP.
+            # CTRL_C_EVENT with process-group 0 is a broadcast to every
+            # process sharing the caller's console and can interrupt the
+            # service/test host itself.  CTRL_BREAK_EVENT is targetable and
+            # Popen sends it specifically to this child's process group.
             try:
-                os.kill(self.proc.pid, signal.SIGINT)
-            except (OSError, AttributeError):
-                log.warning("send_interrupt fallback failed for process %s", self.process_id)
+                self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+            except (OSError, ValueError, AttributeError):
+                log.warning(
+                    "targeted interrupt failed for process %s", self.process_id
+                )
+            return
+
+        try:
+            os.kill(self.proc.pid, signal.SIGINT)
+        except (OSError, AttributeError):
+            log.warning("send_interrupt fallback failed for process %s", self.process_id)
 
     def release_slot(self) -> bool:
         """Release the scheduler lease exactly once."""
@@ -1336,6 +1347,13 @@ class ProcessManager:
         merged = dict(os.environ)
         if env is not None:
             merged.update(env)
+
+        # stdout/stderr are inherited file handles, so Popen's ``encoding``
+        # does not transcode Python's output.  Without an explicit setting,
+        # Windows Python uses the active ANSI/OEM code page (for example
+        # cp936), while read_process_output's byte contract is UTF-8.
+        merged["PYTHONUTF8"] = "1"
+        merged["PYTHONIOENCODING"] = "utf-8"
 
         proxy_cfg = get_proxy_config()
         if proxy_cfg.get("enabled", True):

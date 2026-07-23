@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import signal
 import time
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,7 @@ class FakeProcess:
         self.returncode: int | None = None
         self.exits_on_terminate = exits_on_terminate
         self.terminate_calls = 0
+        self.signal_calls: list[int] = []
 
     def poll(self) -> int | None:
         return self.returncode
@@ -39,6 +42,27 @@ class FakeProcess:
         self.terminate_calls += 1
         if self.exits_on_terminate:
             self.returncode = -15
+
+    def send_signal(self, requested_signal: int) -> None:
+        self.signal_calls.append(requested_signal)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows console-event regression")
+def test_pipe_interrupt_targets_only_child_process_group(tmp_path: Path) -> None:
+    proc = FakeProcess(101, exits_on_terminate=False)
+    running = _RunningProcess(
+        process_id="pr-00000001",
+        workspace_id="ws-00000001",
+        proc=proc,
+        stdout_path=tmp_path / "stdout.txt",
+        stderr_path=tmp_path / "stderr.txt",
+        working_directory=tmp_path,
+        deadline=time.monotonic() + 60,
+    )
+
+    running.send_interrupt()
+
+    assert proc.signal_calls == [signal.CTRL_BREAK_EVENT]
 
 
 def test_shutdown_interrupts_terminates_then_kills(tmp_path: Path) -> None:
