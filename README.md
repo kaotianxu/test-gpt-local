@@ -87,9 +87,10 @@ supervisor, so normal use does not require open terminal windows.
 .\scripts\uninstall-service.ps1
 ```
 
-The installer uses the current user with limited privileges. It removes the legacy
-two-task layout, is safe to run again when upgrading, and preserves the database,
-configuration, logs, and worktrees on uninstall. `start-mcp.ps1` and
+The installer uses the current user with limited privileges and launches the supervisor
+with `pythonw.exe`, so Windows does not allocate a console or open a Windows Terminal
+window. It removes the legacy two-task layout, is safe to run again when upgrading, and
+preserves the database, configuration, logs, and worktrees on uninstall. `start-mcp.ps1` and
 `start-tunnel.ps1` remain available for foreground debugging.
 
 Runtime status is stored atomically in `data/service/status.json`. Rotating supervisor,
@@ -152,13 +153,22 @@ tunnel-client init `
 | `discard_workspace` | Delete worktree |
 | `get_repo_map` | Directory overview |
 | `search_code` | ripgrep search |
+| `list_symbols` | List language-aware declarations in a path |
+| `find_definition` | Find symbol definitions |
+| `find_references` | Find identifier references |
+| `find_implementations` | Find subclasses and implementations |
+| `get_call_hierarchy` | Inspect incoming and outgoing calls |
+| `get_diagnostics` | Parse source and configuration diagnostics |
+| `get_changed_symbols` | Find symbols changed between Git revisions |
 | `read_files` | Read file segments |
 | `apply_patch` | Apply unified diff |
 | `run_pwsh` | Execute PowerShell 7 |
 | `run_check` | Run configured checks |
 | `get_process_result` | Get async process output |
 | `cancel_process` | Terminate process tree |
-| `read_process_output` | Page through captured stdout or stderr |
+| `read_process_output` | Page through stdout/stderr with an opaque UTF-8 byte cursor |
+| `get_events` | Read or long-poll durable workspace/process lifecycle events |
+| `subscribe_process` | Long-poll one process using the same event cursor |
 | `run_command` | Run batch or interactive PTY commands |
 | `write_process_input` | Send ordered input to an interactive process |
 | `send_process_signal` | Send interrupt, EOF, or terminate |
@@ -179,6 +189,18 @@ tunnel-client init `
 
 - `config/operator.yaml` — Server, proxy, process, and logging settings
 - `config/projects.yaml` — Registered project definitions
+
+### Durable process events
+
+Commands emit an append-only workspace event stream with `tool.queued`,
+`tool.started`, `process.output`, `process.exited`, `artifact.created`, and
+`check.completed` events. First call `get_events` with `cursor=null` to capture
+the current tail, then start an asynchronous command with `wait=false` and reuse
+that cursor with `wait_seconds` to long-poll without fixed-interval status
+polling. `process.output` contains byte ranges only; pass the returned output
+cursor to `read_process_output` to retrieve content without splitting UTF-8
+characters. Retention, page, payload, wait-time, and waiter limits are
+configured under `events` in `config/operator.yaml`.
 
 ## Project Structure
 

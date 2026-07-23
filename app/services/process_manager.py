@@ -31,9 +31,11 @@ from typing import Any, cast
 
 from app.config import (
     BASE_DIR,
+    get_events_config,
     get_process_config,
     get_proxy_config,
 )
+from app.services.event_store import TERMINAL_PROCESS_STATUSES, EventStore
 from app.services.process_recovery import pid_alive, process_creation_identity
 from app.services.process_resources import (
     ProcessResourceController,
@@ -47,6 +49,7 @@ from app.services.process_scheduler import (
     QueueTimeoutError,
     ResourceLimits,
 )
+from app.services.subprocess_utils import no_window_creationflags
 from app.storage import database as db
 from app.storage.database import Database
 
@@ -118,6 +121,8 @@ class _RunningProcess:
         lease: ProcessLease | None = None,
         creation_identity: str | None = None,
         resource_handle: ProcessResourceHandle | None = None,
+        tool_name: str = "run_pwsh",
+        request_id: str | None = None,
     ) -> None:
         self.process_id = process_id
         self.workspace_id = workspace_id
@@ -134,6 +139,9 @@ class _RunningProcess:
         self.lease = lease
         self.creation_identity = creation_identity
         self.resource_handle = resource_handle
+        self.tool_name = tool_name
+        self.request_id = request_id
+        self.output_offsets = {"stdout": 0, "stderr": 0}
         self._lock = threading.RLock()
         self._completed = threading.Event()
         self._finalized = False
@@ -161,6 +169,10 @@ class _RunningProcess:
     def mark_done(self) -> None:
         """Mark process completion for waiters."""
         self._completed.set()
+
+    def wait_done(self, timeout: float | None = None) -> bool:
+        """Wait for lifecycle finalization rather than polling the child."""
+        return self._completed.wait(timeout)
 
     def write_stdin(self, text: str, append_newline: bool = True) -> None:
         """Write *text* to the process's stdin (PTY or pipe)."""
@@ -257,6 +269,7 @@ class ProcessManager:
         processes_dir: Path | None = None,
         scheduler: ProcessScheduler | None = None,
         resource_controller: ProcessResourceController | None = None,
+        event_store: EventStore | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._database: Any = database if database is not None else db
@@ -296,7 +309,23 @@ class ProcessManager:
             max_disk_bytes=_optional_positive_int(cfg.get("max_disk_bytes")),
         )
         self._resource_controller = resource_controller or ProcessResourceController()
+        event_cfg = get_events_config()
+        self._events_enabled = bool(event_cfg.get("enabled", True)) and (
+            event_store is not None or callable(getattr(self._database, "connect", None))
+        )
+        self._event_store = event_store or EventStore(
+            self._database,
+            max_payload_bytes=int(event_cfg["max_payload_bytes"]),
+            max_page_size=int(event_cfg["max_page_size"]),
+            max_wait_seconds=float(event_cfg["max_wait_seconds"]),
+            max_waiters=int(event_cfg["max_waiters"]),
+        )
         self._shutting_down = False
+
+    @property
+    def event_store(self) -> EventStore:
+        """Return the app-scoped durable event store."""
+        return self._event_store
 
     # ---- Public API --------------------------------------------------------
 
@@ -332,6 +361,7 @@ class ProcessManager:
         tool_name: str = "run_pwsh",
         concurrency_write: bool = True,
         priority: int = 0,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         """Execute a PowerShell script via stdin and return the process result.
 
@@ -346,12 +376,6 @@ class ProcessManager:
         timeout = min(
             timeout_seconds or self._default_timeout,
             self._max_timeout,
-        )
-
-        lease = self._acquire_lease(
-            workspace_id,
-            write=concurrency_write,
-            priority=priority,
         )
 
         # ---- generate process id ----
@@ -385,14 +409,38 @@ class ProcessManager:
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
         )
+        self._append_event(
+            "tool.queued",
+            workspace_id=workspace_id,
+            process_id=process_id,
+            request_id=request_id,
+            payload={"tool_name": tool_name, "priority": priority},
+        )
+        try:
+            lease = self._acquire_lease(
+                workspace_id,
+                write=concurrency_write,
+                priority=priority,
+            )
+        except RuntimeError:
+            self._transition_record(
+                process_id,
+                "failed",
+                exit_code=-1,
+                reason="queue_timeout",
+                recovery_status="queue_timeout",
+                request_id=request_id,
+            )
+            raise
 
         # ---- spawn subprocess ----
         try:
             stdout_file = open(stdout_path, "w", encoding="utf-8")
             stderr_file = open(stderr_path, "w", encoding="utf-8")
         except OSError as exc:
-            self._database.update_process_status(process_id, "failed", exit_code=-1)
-            self._database.complete_operation(process_id)
+            self._transition_record(
+                process_id, "failed", exit_code=-1, reason="output_open_failed"
+            )
             lease.release()
             return {
                 "error": f"cannot open output files: {exc}",
@@ -420,16 +468,14 @@ class ProcessManager:
                 encoding="utf-8",
                 errors="replace",
                 start_new_session=os.name != "nt",
-                creationflags=(
-                    int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
-                    if os.name == "nt"
-                    else 0
-                ),
+                creationflags=no_window_creationflags(new_process_group=True),
             )
         except FileNotFoundError:
             stdout_file.close()
             stderr_file.close()
-            self._database.update_process_status(process_id, "failed", exit_code=-1)
+            self._transition_record(
+                process_id, "failed", exit_code=-1, reason="executable_not_found"
+            )
             lease.release()
             return {
                 "error": f"pwsh executable not found: {pwsh_path}",
@@ -438,7 +484,9 @@ class ProcessManager:
         except OSError as exc:
             stdout_file.close()
             stderr_file.close()
-            self._database.update_process_status(process_id, "failed", exit_code=-1)
+            self._transition_record(
+                process_id, "failed", exit_code=-1, reason="process_spawn_failed"
+            )
             lease.release()
             return {
                 "error": f"cannot start pwsh: {exc}",
@@ -452,7 +500,12 @@ class ProcessManager:
             process=proc,
             limits=self._resource_limits,
         )
-        self._database.update_process_status(process_id, "running", pid=proc.pid)
+        self._mark_process_started(
+            process_id,
+            pid=proc.pid,
+            tool_name=tool_name,
+            request_id=request_id,
+        )
         self._database.update_process_runtime(
             process_id,
             pid=proc.pid,
@@ -486,6 +539,8 @@ class ProcessManager:
             lease=lease,
             creation_identity=creation_identity,
             resource_handle=resource_handle,
+            tool_name=tool_name,
+            request_id=request_id,
         )
 
         with self._lock:
@@ -530,6 +585,41 @@ class ProcessManager:
 
         return self._build_result(record, stdout_path, stderr_path, tail)
 
+    def wait_for_terminal(
+        self,
+        process_id: str,
+        timeout_seconds: float,
+        *,
+        tail_chars: int | None = None,
+    ) -> dict[str, Any]:
+        """Wait for process finalization without fixed-interval status polling."""
+        if timeout_seconds < 0:
+            raise ValueError("timeout_seconds must not be negative")
+        record = self._database.get_process(process_id)
+        if record is None:
+            return {"error": f"process not found: {process_id}", "process_id": process_id}
+        if str(record["status"]) in TERMINAL_PROCESS_STATUSES:
+            return self.get_result(process_id, tail_chars=tail_chars)
+
+        running = self._get_running(process_id)
+        if running is not None:
+            running.wait_done(timeout_seconds)
+            return self.get_result(process_id, tail_chars=tail_chars)
+
+        cursor = self._event_store.list_after(
+            None,
+            workspace_id=str(record["workspace_id"]),
+            process_id=process_id,
+        )["cursor"]
+        self._event_store.wait_after(
+            str(cursor),
+            workspace_id=str(record["workspace_id"]),
+            process_id=process_id,
+            event_types=["process.exited"],
+            timeout_seconds=timeout_seconds,
+        )
+        return self.get_result(process_id, tail_chars=tail_chars)
+
     def cancel(self, process_id: str) -> dict[str, Any]:
         """Terminate a running process and its child process tree."""
         if not _PROCESS_ID_RE.match(process_id):
@@ -573,10 +663,13 @@ class ProcessManager:
                 rp.proc.terminate()
             except OSError:
                 pass
-        self._database.update_process_status(
+        self._emit_output_events(rp)
+        self._transition_record(
             process_id,
-            status="cancelled",
-            completed_at=_now_iso(),
+            "cancelled",
+            reason="cancelled_by_caller",
+            request_id=rp.request_id,
+            output_offsets=rp.output_offsets,
         )
 
         rp.mark_done()
@@ -620,6 +713,7 @@ class ProcessManager:
             processes = [rp for rp in self._running.values() if rp.claim_completion()]
 
         if not processes:
+            self._event_store.shutdown()
             return {"interrupted": 0, "terminated": 0, "killed": 0, "total": 0}
 
         stages = {rp.process_id: "service_shutdown_interrupt" for rp in processes}
@@ -649,19 +743,15 @@ class ProcessManager:
 
         for rp in processes:
             exit_code = rp.proc.poll()
-            self._database.update_process_status(
+            self._emit_output_events(rp)
+            self._transition_record(
                 rp.process_id,
-                status="interrupted",
+                "interrupted",
                 exit_code=exit_code if exit_code is not None else -1,
-                completed_at=_now_iso(),
-            )
-            self._database.update_process_runtime(
-                rp.process_id,
-                heartbeat=_now_iso(),
-                last_output_offset=self._resource_limits.output_usage(
-                    (rp.stdout_path, rp.stderr_path)
-                ),
                 recovery_status=stages[rp.process_id],
+                reason=stages[rp.process_id],
+                request_id=rp.request_id,
+                output_offsets=rp.output_offsets,
             )
             rp.mark_done()
             with self._lock:
@@ -670,6 +760,7 @@ class ProcessManager:
             self._cleanup_pty(rp)
             self._register_process_artifacts(rp)
 
+        self._event_store.shutdown()
         interrupted = sum(
             stage == "service_shutdown_interrupt" for stage in stages.values()
         )
@@ -747,9 +838,7 @@ class ProcessManager:
             self._max_timeout,
         )
 
-        lease = self._acquire_lease(workspace_id, write=True, priority=0)
         if not 20 <= columns <= 500 or not 5 <= rows <= 200:
-            lease.release()
             return {"error": "terminal dimensions must be columns 20-500 and rows 5-200"}
 
         # ---- generate process id ----
@@ -785,6 +874,25 @@ class ProcessManager:
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
         )
+        self._append_event(
+            "tool.queued",
+            workspace_id=workspace_id,
+            process_id=process_id,
+            request_id=request_id,
+            payload={"tool_name": tool_name, "priority": 0},
+        )
+        try:
+            lease = self._acquire_lease(workspace_id, write=True, priority=0)
+        except RuntimeError:
+            self._transition_record(
+                process_id,
+                "failed",
+                exit_code=-1,
+                reason="queue_timeout",
+                recovery_status="queue_timeout",
+                request_id=request_id,
+            )
+            raise
 
         # ---- Build the command line ----
         cmd_parts = self._build_command_line(shell, command)
@@ -804,7 +912,9 @@ class ProcessManager:
 
         use_conpty = tty and _has_conpty()
         if tty and os.name == "nt" and not use_conpty:
-            self._database.update_process_status(process_id, "failed", exit_code=-1)
+            self._transition_record(
+                process_id, "failed", exit_code=-1, reason="pty_unavailable"
+            )
             lease.release()
             return {
                 "error": "ConPTY is unavailable on this Windows host",
@@ -879,7 +989,9 @@ class ProcessManager:
                         conpty_wrapper.close(pty_handle, pty_input_write, pty_output_read)
                     except Exception:
                         pass
-                self._database.update_process_status(process_id, "failed", exit_code=-1)
+                self._transition_record(
+                    process_id, "failed", exit_code=-1, reason="pty_create_failed"
+                )
                 lease.release()
                 return {
                     "error": f"ConPTY creation failed: {exc}",
@@ -893,7 +1005,9 @@ class ProcessManager:
                 stdout_file = open(stdout_path, "w", encoding="utf-8")
                 stderr_file = open(stderr_path, "w", encoding="utf-8")
             except OSError as exc:
-                self._database.update_process_status(process_id, "failed", exit_code=-1)
+                self._transition_record(
+                    process_id, "failed", exit_code=-1, reason="output_open_failed"
+                )
                 lease.release()
                 return {
                     "error": f"cannot open output files: {exc}",
@@ -912,17 +1026,15 @@ class ProcessManager:
                     encoding="utf-8",
                     errors="replace",
                     start_new_session=os.name != "nt",
-                    creationflags=(
-                        int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
-                        if os.name == "nt"
-                        else 0
-                    ),
+                    creationflags=no_window_creationflags(new_process_group=True),
                 )
                 stdin_pipe = proc.stdin
             except FileNotFoundError:
                 stdout_file.close()
                 stderr_file.close()
-                self._database.update_process_status(process_id, "failed", exit_code=-1)
+                self._transition_record(
+                    process_id, "failed", exit_code=-1, reason="executable_not_found"
+                )
                 lease.release()
                 return {
                     "error": f"executable not found: {cmd_parts[0] if cmd_parts else command}",
@@ -931,7 +1043,9 @@ class ProcessManager:
             except OSError as exc:
                 stdout_file.close()
                 stderr_file.close()
-                self._database.update_process_status(process_id, "failed", exit_code=-1)
+                self._transition_record(
+                    process_id, "failed", exit_code=-1, reason="process_spawn_failed"
+                )
                 lease.release()
                 return {
                     "error": f"cannot start process: {exc}",
@@ -946,7 +1060,12 @@ class ProcessManager:
             process=proc,
             limits=self._resource_limits,
         )
-        self._database.update_process_status(process_id, "running", pid=actual_pid)
+        self._mark_process_started(
+            process_id,
+            pid=actual_pid,
+            tool_name=tool_name,
+            request_id=request_id,
+        )
         self._database.update_process_runtime(
             process_id,
             pid=actual_pid,
@@ -977,6 +1096,8 @@ class ProcessManager:
             lease=lease,
             creation_identity=creation_identity,
             resource_handle=resource_handle,
+            tool_name=tool_name,
+            request_id=request_id,
         )
 
         with self._lock:
@@ -1091,6 +1212,121 @@ class ProcessManager:
 
     # ---- Internal helpers --------------------------------------------------
 
+    def _append_event(
+        self,
+        event_type: str,
+        *,
+        workspace_id: str,
+        process_id: str,
+        payload: Mapping[str, Any],
+        request_id: str | None = None,
+    ) -> None:
+        if not self._events_enabled:
+            return
+        try:
+            self._event_store.append(
+                event_type,
+                request_id=request_id,
+                workspace_id=workspace_id,
+                process_id=process_id,
+                payload=payload,
+            )
+        except Exception:
+            log.exception("failed to append %s for %s", event_type, process_id)
+
+    def _mark_process_started(
+        self,
+        process_id: str,
+        *,
+        pid: int,
+        tool_name: str,
+        request_id: str | None,
+    ) -> None:
+        if self._events_enabled:
+            try:
+                self._event_store.start_process(
+                    process_id,
+                    pid=pid,
+                    tool_name=tool_name,
+                    request_id=request_id,
+                )
+                return
+            except Exception:
+                log.exception("failed to atomically start process %s", process_id)
+        self._database.update_process_status(process_id, "running", pid=pid)
+
+    def _transition_record(
+        self,
+        process_id: str,
+        status: str,
+        *,
+        exit_code: int | None = None,
+        recovery_status: str | None = None,
+        reason: str | None = None,
+        request_id: str | None = None,
+        output_offsets: Mapping[str, int] | None = None,
+    ) -> None:
+        if self._events_enabled:
+            try:
+                event = self._event_store.transition_process(
+                    process_id,
+                    status,
+                    exit_code=exit_code,
+                    recovery_status=recovery_status,
+                    reason=reason,
+                    request_id=request_id,
+                    output_offsets=output_offsets,
+                )
+                record = self._database.get_process(process_id)
+                tool_name = str(record.get("tool_name", "")) if record else ""
+                if tool_name.startswith("run_check:") and event.get("type") == "process.exited":
+                    self._append_event(
+                        "check.completed",
+                        workspace_id=str(record["workspace_id"]),
+                        process_id=process_id,
+                        request_id=request_id,
+                        payload={
+                            "check_id": tool_name.split(":", 1)[1],
+                            "status": status,
+                            "process_id": process_id,
+                        },
+                    )
+                return
+            except Exception:
+                log.exception("failed to atomically finish process %s", process_id)
+        self._database.update_process_status(
+            process_id,
+            status=status,
+            exit_code=exit_code,
+            completed_at=_now_iso(),
+        )
+        if recovery_status is not None:
+            self._database.update_process_runtime(
+                process_id, recovery_status=recovery_status
+            )
+
+    def _emit_output_events(self, rp: _RunningProcess) -> None:
+        for stream, path in (("stdout", rp.stdout_path), ("stderr", rp.stderr_path)):
+            current = _file_size(path)
+            previous = rp.output_offsets[stream]
+            if current == previous:
+                continue
+            payload: dict[str, Any] = {
+                "stream": stream,
+                "offset_start": previous if current >= previous else 0,
+                "offset_end": current,
+            }
+            if current < previous:
+                payload["warning"] = "output_file_truncated"
+            self._append_event(
+                "process.output",
+                workspace_id=rp.workspace_id,
+                process_id=rp.process_id,
+                request_id=rp.request_id,
+                payload=payload,
+            )
+            rp.output_offsets[stream] = current
+
     def _build_env(self, env: dict[str, str] | None) -> dict[str, str]:
         """Build the environment for the subprocess.
 
@@ -1196,6 +1432,18 @@ class ProcessManager:
         """Return current process admission diagnostics."""
         return self._scheduler.snapshot()
 
+    def record_recovery_terminal(
+        self, process_id: str, status: str, reason: str
+    ) -> None:
+        """Persist one recovery disposition with its terminal event."""
+        self._transition_record(
+            process_id,
+            status,
+            exit_code=-1,
+            recovery_status=reason,
+            reason=reason,
+        )
+
     def adopt_recovered_process(self, record: Mapping[str, Any]) -> bool:
         """Resume monitoring a process whose PID identity survived restart."""
         process_id = str(record.get("process_id", ""))
@@ -1236,12 +1484,28 @@ class ProcessManager:
             deadline=self._clock() + self._default_timeout,
             lease=lease,
             creation_identity=expected_identity,
+            tool_name=str(record.get("tool_name") or "recovered_process"),
         )
+        running.output_offsets = {
+            "stdout": _file_size(stdout_path),
+            "stderr": _file_size(stderr_path),
+        }
         with self._lock:
             if process_id in self._running:
                 lease.release()
                 return True
             self._running[process_id] = running
+        self._append_event(
+            "tool.started",
+            workspace_id=workspace_id,
+            process_id=process_id,
+            payload={
+                "tool_name": running.tool_name,
+                "pid": pid,
+                "working_directory_redacted": ".",
+                "recovered": True,
+            },
+        )
         threading.Thread(target=self._watchdog, args=(running,), daemon=True).start()
         return True
 
@@ -1264,18 +1528,16 @@ class ProcessManager:
         """Record process completion and remove from the running table."""
         if not rp.claim_completion():
             return
-        now = _now_iso()
         status = "passed" if exit_code == 0 else "failed"
-        record = self._database.get_process(rp.process_id)
-        # A concurrent cancel/timeout is authoritative; process exit observed
-        # a moment later must not rewrite that terminal state.
-        if record is None or record.get("status") not in {"cancelled", "timed_out"}:
-            self._database.update_process_status(
-                rp.process_id,
-                status=status,
-                exit_code=exit_code,
-                completed_at=now,
-            )
+        self._emit_output_events(rp)
+        self._transition_record(
+            rp.process_id,
+            status,
+            exit_code=exit_code,
+            reason="process_exit",
+            request_id=rp.request_id,
+            output_offsets=rp.output_offsets,
+        )
         rp.mark_done()
         with self._lock:
             self._running.pop(rp.process_id, None)
@@ -1301,6 +1563,7 @@ class ProcessManager:
                 encoding="utf-8",
                 errors="replace",
                 timeout=15,
+                creationflags=no_window_creationflags(),
             )
             summary = f"git status after pwsh: {result.stdout.strip()[:200] or '(clean)'}"
         except Exception as exc:
@@ -1338,6 +1601,7 @@ class ProcessManager:
                     return
 
             violation = self._resource_violation(rp)
+            self._emit_output_events(rp)
             output_offset = self._resource_limits.output_usage(
                 (rp.stdout_path, rp.stderr_path)
             )
@@ -1380,19 +1644,15 @@ class ProcessManager:
             rp.proc.terminate()
         except OSError:
             pass
-        self._database.update_process_status(
+        self._emit_output_events(rp)
+        self._transition_record(
             rp.process_id,
-            status=status,
+            status,
             exit_code=-1,
-            completed_at=_now_iso(),
-        )
-        self._database.update_process_runtime(
-            rp.process_id,
-            heartbeat=_now_iso(),
-            last_output_offset=self._resource_limits.output_usage(
-                (rp.stdout_path, rp.stderr_path)
-            ),
             recovery_status=recovery_status,
+            reason=recovery_status,
+            request_id=rp.request_id,
+            output_offsets=rp.output_offsets,
         )
         rp.mark_done()
         with self._lock:
@@ -1409,7 +1669,10 @@ class ProcessManager:
                     ["taskkill", "/PID", str(pid), "/T", "/F"],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=10,
+                    creationflags=no_window_creationflags(),
                 )
                 # taskkill reports a non-zero status when the process already
                 # exited; that is still an idempotent terminal outcome.
@@ -1482,17 +1745,39 @@ class ProcessManager:
         try:
             from app.services import artifact_registry
 
-            artifact_registry.register_process_output_artifacts(
+            records = artifact_registry.register_process_output_artifacts(
                 rp.workspace_id,
                 rp.process_id,
                 rp.stdout_path,
                 rp.stderr_path,
             )
-            artifact_registry.discover_artifacts(
-                rp.working_directory,
-                rp.workspace_id,
-                process_id=rp.process_id,
+            records.extend(
+                artifact_registry.discover_artifacts(
+                    rp.working_directory,
+                    rp.workspace_id,
+                    process_id=rp.process_id,
+                )
             )
+            seen: set[str] = set()
+            for record in records:
+                artifact_id = str(record.get("artifact_id", ""))
+                if not artifact_id or artifact_id in seen:
+                    continue
+                seen.add(artifact_id)
+                self._append_event(
+                    "artifact.created",
+                    workspace_id=rp.workspace_id,
+                    process_id=rp.process_id,
+                    request_id=rp.request_id,
+                    payload={
+                        "artifact_id": artifact_id,
+                        "kind": str(record.get("kind", "unknown")),
+                        "relative_path": _redacted_artifact_path(
+                            str(record.get("path", "")), rp.working_directory
+                        ),
+                        "size_bytes": int(record.get("size_bytes", 0)),
+                    },
+                )
         except Exception as exc:
             log.warning("artifact registration failed for %s: %s", rp.process_id, exc)
 
@@ -1660,6 +1945,23 @@ def _directory_size(root: Path) -> int:
         except OSError:
             continue
     return total
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _redacted_artifact_path(raw_path: str, workspace: Path) -> str:
+    path = Path(raw_path)
+    if not path.is_absolute():
+        return path.as_posix()
+    try:
+        return path.resolve().relative_to(workspace.resolve()).as_posix()
+    except (OSError, ValueError):
+        return path.name
 
 
 def _now_iso() -> str:

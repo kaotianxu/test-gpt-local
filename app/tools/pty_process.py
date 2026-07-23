@@ -29,16 +29,15 @@ from app.services.envelope import (
     generate_request_id,
     ok_result,
 )
+from app.services.event_store import TERMINAL_PROCESS_STATUSES
 from app.services.path_guard import is_denied, resolve_within
 from app.services.process_manager import ProcessManager
+from app.services.subprocess_utils import no_window_creationflags
 from app.services.workspace_manager import get_workspace
 
 log = logging.getLogger(__name__)
 
 # Poll interval (seconds) when waiting for a process to finish.
-_WAIT_POLL_INTERVAL = 0.5
-
-
 def _git_status(worktree: Path) -> str | None:
     """Run ``git status --short --branch`` and return the stdout, or None."""
     import subprocess
@@ -52,6 +51,7 @@ def _git_status(worktree: Path) -> str | None:
             encoding="utf-8",
             errors="replace",
             timeout=15,
+            creationflags=no_window_creationflags(),
         )
         return result.stdout.strip() or None
     except Exception:
@@ -155,43 +155,11 @@ def _run_command(
 
     # ---- 5. Wait (if requested) ----
     if wait:
-        # Poll until the status changes from "running"/"queued".
-        terminal_statuses = {
-            "passed",
-            "failed",
-            "timed_out",
-            "cancelled",
-            "resource_exhausted",
-            "interrupted",
-            "lost",
-            "recovery_required",
-        }
-        deadline = time.monotonic() + timeout + 5
-        while time.monotonic() < deadline:
+        result = pm.wait_for_terminal(process_id, timeout + 5)
+        timed_out = result.get("status") not in TERMINAL_PROCESS_STATUSES
+        if timed_out:
+            pm.cancel(process_id)
             result = pm.get_result(process_id)
-            status = result.get("status", "")
-            if status in terminal_statuses:
-                result["git_status_after"] = _git_status(worktree)
-                final = ok_result(
-                    result,
-                    workspace_id=workspace_id,
-                    request_id=request_id,
-                    truncated=bool(result.get("truncated")),
-                )
-                audit_event(
-                    tool_name="run_command",
-                    request_id=request_id,
-                    workspace_id=workspace_id,
-                    input_summary=f"shell={shell!r} tty={tty} wait={wait}",
-                    success=True,
-                    duration_ms=elapsed_ms(start),
-                )
-                return final
-            time.sleep(_WAIT_POLL_INTERVAL)
-
-        # Timed out waiting.
-        pm.cancel(process_id)
-        result = pm.get_result(process_id)
         result["git_status_after"] = _git_status(worktree)
         response = ok_result(
             result,
@@ -202,7 +170,8 @@ def _run_command(
         audit_event(
             tool_name="run_command", request_id=request_id,
             workspace_id=workspace_id, input_summary=input_summary,
-            success=False, duration_ms=elapsed_ms(start), error_code="PROCESS_TIMEOUT",
+            success=not timed_out, duration_ms=elapsed_ms(start),
+            error_code="PROCESS_TIMEOUT" if timed_out else None,
         )
         return response
 

@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from app.services.subprocess_utils import no_window_creationflags
+
 
 def process_creation_identity(pid: int) -> str | None:
     """Return a stable process creation identity, or ``None`` if unavailable.
@@ -50,6 +52,7 @@ def process_creation_identity(pid: int) -> str | None:
             errors="replace",
             timeout=2,
             check=False,
+            creationflags=no_window_creationflags(),
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -102,25 +105,49 @@ def recover_processes(
 
         if status == "queued":
             disposition = "interrupted"
-            _terminal(database, process_id, disposition, "queued_without_process")
+            _terminal(
+                database,
+                process_id,
+                disposition,
+                "queued_without_process",
+                process_manager,
+            )
         else:
             raw_pid = record.get("pid")
             pid = int(raw_pid) if isinstance(raw_pid, int) or str(raw_pid).isdigit() else 0
             if pid <= 0:
                 disposition = "recovery_required"
-                _terminal(database, process_id, disposition, "missing_pid")
+                _terminal(database, process_id, disposition, "missing_pid", process_manager)
             elif not alive_checker(pid):
                 disposition = "interrupted"
-                _terminal(database, process_id, disposition, "process_not_found")
+                _terminal(
+                    database,
+                    process_id,
+                    disposition,
+                    "process_not_found",
+                    process_manager,
+                )
             else:
                 expected = record.get("process_creation_identity")
                 current = identity_reader(pid)
                 if not expected or current is None:
                     disposition = "recovery_required"
-                    _terminal(database, process_id, disposition, "identity_unavailable")
+                    _terminal(
+                        database,
+                        process_id,
+                        disposition,
+                        "identity_unavailable",
+                        process_manager,
+                    )
                 elif str(expected) != current:
                     disposition = "lost"
-                    _terminal(database, process_id, disposition, "pid_identity_mismatch")
+                    _terminal(
+                        database,
+                        process_id,
+                        disposition,
+                        "pid_identity_mismatch",
+                        process_manager,
+                    )
                 else:
                     adopted = True
                     if process_manager is not None:
@@ -138,7 +165,13 @@ def recover_processes(
                         )
                     else:
                         disposition = "recovery_required"
-                        _terminal(database, process_id, disposition, "monitor_adoption_failed")
+                        _terminal(
+                            database,
+                            process_id,
+                            disposition,
+                            "monitor_adoption_failed",
+                            process_manager,
+                        )
 
         summary[disposition] += 1
         summary["records"].append(
@@ -147,7 +180,18 @@ def recover_processes(
     return summary
 
 
-def _terminal(database: Any, process_id: str, status: str, reason: str) -> None:
+def _terminal(
+    database: Any,
+    process_id: str,
+    status: str,
+    reason: str,
+    process_manager: Any | None,
+) -> None:
+    if process_manager is not None and hasattr(
+        process_manager, "record_recovery_terminal"
+    ):
+        process_manager.record_recovery_terminal(process_id, status, reason)
+        return
     database.update_process_status(process_id, status, completed_at=_now_iso())
     database.update_process_runtime(process_id, recovery_status=reason)
 

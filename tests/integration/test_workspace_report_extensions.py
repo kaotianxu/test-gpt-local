@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -121,6 +122,42 @@ def test_active_process_and_missing_test_evidence_block_acceptance(
     assert result["acceptance_ready"] is False
     assert "active_processes" in result["acceptance_blockers"]
     assert "test_step_missing_successful_evidence" in result["acceptance_blockers"]
+
+
+def test_report_bounds_process_output_and_compacts_artifacts(
+    acceptance_db: Path,
+) -> None:
+    process_id = _passed_check(acceptance_db)
+    process_dir = acceptance_db / "process-output"
+    process_dir.mkdir()
+    stdout_path = process_dir / "stdout.txt"
+    stderr_path = process_dir / "stderr.txt"
+    stdout_path.write_text("x" * 100_000, encoding="utf-8")
+    stderr_path.write_text("y" * 100_000, encoding="utf-8")
+    connection = db._get_connection()
+    connection.execute(
+        "UPDATE processes SET stdout_path = ?, stderr_path = ? WHERE process_id = ?",
+        (str(stdout_path), str(stderr_path), process_id),
+    )
+    connection.commit()
+    artifact = artifact_registry.register_artifact(
+        "ws-00000001", str(acceptance_db / "README.md"), kind="text"
+    )
+    connection.execute(
+        "UPDATE artifacts SET source_process_id = ? WHERE artifact_id = ?",
+        (process_id, artifact["artifact_id"]),
+    )
+    connection.commit()
+
+    envelope = reports._get_workspace_report("ws-00000001")
+    process = envelope["result"]["processes"][0]
+
+    assert len(process["stdout_tail"]) == reports._REPORT_PROCESS_OUTPUT_CHARS
+    assert len(process["stderr_tail"]) == reports._REPORT_PROCESS_OUTPUT_CHARS
+    assert process["truncated"] is True
+    assert process["artifact_ids"] == [artifact["artifact_id"]]
+    assert "artifacts" not in process
+    assert len(json.dumps(envelope)) < 20_000
 
 
 def test_recovery_cleanup_and_concurrent_artifact_registration(

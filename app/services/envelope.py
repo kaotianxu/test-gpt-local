@@ -25,6 +25,8 @@ Stable error codes
 - ``CHECK_NOT_FOUND`` — check_id does not exist in the project config
 - ``INVALID_INPUT`` — missing or malformed parameters
 - ``IDEMPOTENCY_KEY_MISMATCH`` — same idempotency_key used with different input
+- ``INVALID_CURSOR`` — pagination/event cursor is malformed or unsupported
+- ``EVENT_CURSOR_EXPIRED`` — event retention removed history required by the cursor
 - ``INTERNAL_ERROR`` — unexpected server-side failure
 - ``RATE_LIMITED`` — too many concurrent operations
 - ``NOT_IMPLEMENTED`` — feature is not yet available

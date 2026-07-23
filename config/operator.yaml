@@ -54,6 +54,16 @@ artifacts:
   cleanup_on_workspace_discard: true
   max_discovery_files: 100
 
+events:
+  enabled: true
+  retention_days: 7
+  max_events_per_workspace: 50000
+  max_payload_bytes: 16384
+  max_page_size: 500
+  max_wait_seconds: 25
+  max_waiters: 32
+  output_coalesce_ms: 100
+
 logging:
   level: INFO
   retention_days: 14

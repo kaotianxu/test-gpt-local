@@ -12,6 +12,7 @@ from mcp.server.fastmcp import FastMCP
 from starlette.responses import JSONResponse
 
 from app.config import (
+    get_events_config,
     get_logging_config,
     get_mcp_path,
     get_server_bind,
@@ -26,6 +27,8 @@ from app.tools import (
     artifacts,
     capabilities,
     checks,
+    code_intelligence,
+    events,
     git_tools,
     patcher,
     plans,
@@ -73,6 +76,11 @@ def create_app() -> FastMCP:
     process_manager = ProcessManager(database=database)
     ProcessManager.configure_instance(process_manager)
     atexit.register(process_manager.shutdown)
+    event_cfg = get_events_config()
+    process_manager.event_store.cleanup(
+        retention_days=int(event_cfg["retention_days"]),
+        max_events_per_workspace=int(event_cfg["max_events_per_workspace"]),
+    )
     recovery = recover_processes(database, process_manager)
     if any(recovery[key] for key in ("recovered", "interrupted", "lost", "recovery_required")):
         log.warning(
@@ -160,6 +168,8 @@ def create_app() -> FastMCP:
     workspaces.register_tools(tool_mcp)
     repo_map.register_tools(tool_mcp)
     search.register_tools(tool_mcp)
+    code_intelligence.register_tools(tool_mcp)
+    events.register_tools(tool_mcp)
     reader.register_tools(tool_mcp)
     git_tools.register_tools(tool_mcp)
     reports.register_tools(tool_mcp)

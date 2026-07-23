@@ -38,4 +38,5 @@ testpaths = ["tests"]
 markers = [
     "smoke: live, read-only MCP contract smoke test",
     "smoke_mutating: smoke test that creates and deletes a Git worktree",
+    "section4_live: opt-in live acceptance for Section 4 code intelligence",
 ]

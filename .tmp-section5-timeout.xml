@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1" time="1.367" timestamp="2026-07-23T15:45:43.558993+08:00" hostname="Tim"><testcase classname="tests.integration.test_event_stream" name="test_timeout_has_terminal_event" time="1.342" /></testsuite></testsuites>

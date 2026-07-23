@@ -243,7 +243,59 @@ get_changed_symbols(base, head)
 
 `run_pwsh(wait=True)` 和 `run_command(wait=True)` 当前每 0.5 秒轮询一次状态。输出读取也需要调用方反复传 offset。
 
-建议建立 append-only event stream：
+### 5.1 本节目标和范围
+
+本节先解决两个具体问题：
+
+1. Server 内部的 `wait=True` 不再通过 `time.sleep(0.5)` 轮询 `get_result()`。
+2. 异步调用方可以阻塞等待“有新事件或超时”，不再固定间隔调用
+   `get_process_result()` 和 `read_process_output()`。
+
+第一版不直接实现 WebSocket，也不依赖 MCP transport 的 server push。先实现：
+
+* SQLite 持久化的 append-only 事件表；
+* 进程内 `Condition`/`Event` 唤醒；
+* MCP 工具 `get_events(..., wait_seconds=...)`，即 long polling；
+* `ProcessManager.wait_for_terminal()`，供 `run_pwsh`、`run_command` 和
+  `run_check` 的 `wait=True` 共用。
+
+第一版事件只携带元数据和小型摘要。`process.output` 只说明哪个 stream
+从哪个 offset 增长到哪个 offset，不把任意长度的 stdout/stderr 复制到 SQLite。
+调用方收到事件后，继续用 `read_process_output()` 按 cursor 读取内容。
+
+以下内容明确放到第二阶段：
+
+* WebSocket/SSE 或 MCP 原生通知；
+* 跨多实例的外部消息总线；
+* 全量 OpenTelemetry exporter；
+* 将每一小段 stdout/stderr 都写入数据库。
+
+### 5.2 事件数据模型
+
+增加 `events` 表：
+
+```sql
+CREATE TABLE events (
+    event_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id     TEXT,
+    workspace_id   TEXT,
+    process_id     TEXT,
+    event_type     TEXT NOT NULL,
+    sequence       INTEGER,
+    payload_json   TEXT NOT NULL DEFAULT '{}',
+    created_at     TEXT NOT NULL
+);
+
+CREATE INDEX idx_events_workspace_event
+    ON events(workspace_id, event_id);
+CREATE INDEX idx_events_process_event
+    ON events(process_id, event_id);
+CREATE UNIQUE INDEX idx_events_process_sequence
+    ON events(process_id, sequence)
+    WHERE process_id IS NOT NULL AND sequence IS NOT NULL;
+```
+
+事件 envelope：
 
 ```json
 {
@@ -253,31 +305,267 @@ get_changed_symbols(base, head)
   "process_id": "pr_x",
   "type": "process.output",
   "sequence": 42,
-  "stream": "stdout",
-  "offset": 8192
+  "created_at": "ISO-8601 timestamp",
+  "payload": {
+    "stream": "stdout",
+    "offset_start": 4096,
+    "offset_end": 8192
+  }
 }
 ```
 
-事件类型可以包括：
+规则：
+
+* `event_id` 是全局、单调递增且持久化的 cursor。
+* `sequence` 只在一个 process 内单调递增，用于检测重复或丢失。
+  分配 sequence 时使用 `BEGIN IMMEDIATE` 包住“读取当前值 + 插入”，或使用独立的
+  process counter row；不能在事务外用 `MAX(sequence) + 1`。
+* cursor 对调用方是 opaque string；当前即使编码自 `event_id`，也不能要求调用方解析。
+* `payload_json` 必须有每类事件的固定 schema 和大小上限，建议第一版 16 KiB。
+* 同一数据库事务中先更新业务状态，再插入对应事件，最后 commit，避免“事件存在但状态未更新”。
+* 事件写入失败时，进程收尾不能悬挂；应记录 error log，并由最终状态读取作为兜底。
+
+### 5.3 第一版事件类型
+
+第一版只实现能替代进程轮询的核心类型：
 
 * `tool.queued`
 * `tool.started`
-* `policy.decision`
 * `process.output`
 * `process.exited`
 * `artifact.created`
 * `check.completed`
+
+各类型的最小 payload：
+
+```text
+tool.queued       tool_name, priority
+tool.started      tool_name, pid, working_directory_redacted
+process.output    stream, offset_start, offset_end
+process.exited    status, exit_code, reason, stdout_offset, stderr_offset
+artifact.created  artifact_id, kind, relative_path, size_bytes
+check.completed   check_id, status, process_id
+```
+
+后续再增加：
+
+* `policy.decision`
 * `workspace.changed`
 * `plan.evidence_attached`
 
-然后提供：
+禁止放入事件 payload：
 
-```text
-get_events(after_event_id)
-subscribe_process(process_id)
+* 完整脚本或 command；
+* 环境变量值；
+* API key、cookie、authorization header；
+* workspace 外的绝对路径；
+* 未经过长度限制的 stdout/stderr。
+
+### 5.4 EventStore 和唤醒机制
+
+新增 `app/services/event_store.py`，不要让各工具直接拼 SQL：
+
+```python
+class EventStore:
+    def append(
+        self,
+        event_type: str,
+        *,
+        request_id: str | None = None,
+        workspace_id: str | None = None,
+        process_id: str | None = None,
+        payload: Mapping[str, JSONValue] | None = None,
+    ) -> Event: ...
+
+    def list_after(
+        self,
+        cursor: str | None,
+        *,
+        workspace_id: str | None = None,
+        process_id: str | None = None,
+        limit: int = 100,
+    ) -> EventPage: ...
+
+    def wait_after(
+        self,
+        cursor: str | None,
+        *,
+        workspace_id: str | None = None,
+        process_id: str | None = None,
+        limit: int = 100,
+        timeout_seconds: float = 25,
+    ) -> EventPage: ...
 ```
 
-如果当前 MCP transport 不适合 server push，至少使用 long polling 和 opaque cursor，而不是固定 0.5 秒循环。
+实现要求：
+
+* `append()` commit SQLite 后，在同一个 `Condition` lock 下递增内存 generation，
+  再调用 `notify_all()`。
+* `wait_after()` 先查库；无结果时获取 `Condition` lock，记下 generation，再查一次库；
+  仍无结果且 generation 未变化才调用 `Condition.wait(remaining)`。唤醒后用 `while`
+  循环重新查询 predicate。这样同时避免查询与 wait 之间丢失通知和 spurious wakeup。
+* server shutdown 时唤醒所有 waiter，并返回明确的结束原因。
+* 工具 handler 是 async；阻塞的 `Condition.wait()` 必须通过
+  `asyncio.to_thread()` 或等效方式执行，不能阻塞 MCP event loop。
+* 因 `to_thread()` 等待会占用 worker，第一版设置 `max_waiters=32`；超过上限返回
+  retryable `RATE_LIMITED`，不能无限创建 waiter/thread。
+* 单次 long poll 建议最多 25 秒；`wait_seconds=0` 表示立即返回。
+* `limit` 默认 100，最大 500；超过一页时返回 `next_cursor` 和
+  `has_more=true`，不能等待。
+
+SQLite 是第一版事实来源，`Condition` 只负责同一 server process 内降低延迟。
+服务重启后 waiter 会断开，但已提交事件仍可从 cursor 继续读取。
+
+### 5.5 MCP 工具契约
+
+第一版提供一个通用读取工具：
+
+```text
+get_events(
+    workspace_id,
+    cursor=null,
+    process_id=null,
+    event_types=null,
+    limit=100,
+    wait_seconds=0
+)
+```
+
+返回示例：
+
+```json
+{
+  "events": [],
+  "cursor": "opaque_cursor_for_last_observed_event",
+  "has_more": false,
+  "timed_out": true
+}
+```
+
+契约细节：
+
+* `workspace_id` 必填，防止跨 workspace 订阅。
+* 若传 `process_id`，必须验证 process 属于该 workspace。
+* `cursor=null` 的第一版语义固定为“从调用时的最新位置开始”，避免首次调用
+  意外返回整个历史；如需历史，另加显式 `from_beginning=true`。
+* 空结果但超时是成功响应，不是错误。
+* 无效或过期 cursor 返回稳定错误码 `INVALID_CURSOR` 或
+  `EVENT_CURSOR_EXPIRED`。
+* `event_types` 只能选择已注册事件类型。
+* `get_events` 加入 `ToolSpec` 并标记为 read-only；不要持有普通 workspace
+  concurrency lock 完成整段 long poll，否则会阻塞同 workspace 的写入和事件产生。
+  workspace 隔离由 handler 在进入等待前完成验证。
+* `get_capabilities()` 增加
+  `supports_event_stream`、`supports_event_long_poll` 和 retention/limit 信息。
+
+可以提供 `subscribe_process(process_id, cursor, wait_seconds)` 作为方便调用的薄封装，
+但它不应有第二套存储或 cursor 语义。
+
+### 5.6 ProcessManager 集成点
+
+给 `ProcessManager` 注入同一个 `EventStore`，并在以下位置发事件：
+
+```text
+申请 scheduler lease 前          tool.queued
+lease 成功且 DB 状态为 running 后 tool.started
+检测到 stdout/stderr 长度增加时   process.output
+_finalize() 成功提交终态后         process.exited
+_terminate_running() 提交终态后    process.exited
+cancel() 提交 cancelled 后         process.exited
+shutdown/recovery 状态确定后        process.exited
+artifact registry 创建记录后       artifact.created
+run_check 得到终态后                check.completed
+```
+
+注意当前 `ProcessScheduler.acquire()` 是同步阻塞的，并且 process DB row 在 lease
+成功后才创建。因此若要准确发出 `tool.queued`：
+
+* 要么在进入 `_acquire_lease()` 前生成 `process_id` 并插入 queued row；
+* 要么第一版将 `tool.queued` 定义为 request 级事件，允许 `process_id=null`。
+
+建议选择前者，保证 queued、started、exited 始终可用同一个 `process_id` 关联。
+这要求将 `spawn()` 和 `spawn_interactive()` 中生成 ID、插入 DB、获取 lease 的顺序统一，
+并在 queue timeout 时写入明确终态和事件。
+
+当前 `update_process_status()` 和事件插入会分别 commit。为满足状态与事件原子性，
+需要新增数据库事务 helper，例如
+`transition_process_with_event(process_id, status, event_type, payload)`；
+`_finalize()`、`cancel()`、timeout、shutdown 和 recovery 必须走该 helper，不能先调用
+现有 update 再单独 `EventStore.append()`。
+
+增加：
+
+```python
+ProcessManager.wait_for_terminal(
+    process_id: str,
+    timeout_seconds: float,
+) -> dict[str, Any]
+```
+
+它等待 `_RunningProcess._completed` 或 EventStore 的 `process.exited`，然后只读取一次
+最终 DB/result。`run_pwsh(wait=True)`、`run_command(wait=True)` 和
+`run_check(wait=True)` 全部改用这个方法，删除各自的 `_WAIT_POLL_INTERVAL`
+和重复 terminal-status 集合。
+
+将 terminal statuses 定义在一个公共常量中：
+
+```python
+TERMINAL_PROCESS_STATUSES = frozenset({
+    "passed", "failed", "timed_out", "cancelled",
+    "resource_exhausted", "interrupted", "lost", "recovery_required",
+})
+```
+
+### 5.7 输出事件策略
+
+当前普通进程把 stdout/stderr 直接重定向到文件，Server 不会在每次 child write
+时收到回调；PTY 只有 stdout reader thread。第一版采用低风险方案：
+
+* watchdog 每次 heartbeat 比较 stdout/stderr 的 byte size；
+* 只有 size 增长时才发 `process.output`；
+* 分别维护两个 stream 的最后已发布 byte offset；
+* `_finalize()` 前做最后一次 scan，避免漏掉退出前最后一段输出；
+* PTY reader 可在 flush 后主动通知，但要做 50–100 ms 合并，避免事件风暴。
+
+这里的 offset 统一定义为 UTF-8 文件的 **byte offset**。因此
+`read_process_output()` 也应改成 binary seek + incremental UTF-8 decode，并返回同一种
+opaque cursor。不要继续混用当前的 Python character offset 和 DB 中的 byte size。
+
+合并策略：
+
+* 同一 process/stream 100 ms 内的多次增长合并为一个事件；
+* 每个 `process.output` 只记录范围，不复制内容；
+* process 退出时即使没有新内容也必须发 `process.exited`；
+* output 文件被截断或轮转时发 warning payload，并重置 reader cursor；
+* ANSI 处理仍属于 `read_process_output()`，事件层不修改原始输出。
+
+### 5.8 保留、清理和恢复
+
+增加配置：
+
+```yaml
+events:
+  enabled: true
+  retention_days: 7
+  max_events_per_workspace: 50000
+  max_payload_bytes: 16384
+  max_page_size: 500
+  max_wait_seconds: 25
+  max_waiters: 32
+  output_coalesce_ms: 100
+```
+
+清理规则：
+
+* workspace discard 时删除或归档其 events，行为必须和 plan/artifact 一致；
+* 日常清理按 retention 和 workspace 上限分批删除，不能长时间锁 DB；
+* 返回的最小可用 cursor 应可检测；请求已清理历史时返回
+  `EVENT_CURSOR_EXPIRED`，并附当前可恢复的 cursor；
+* 进程恢复后先发 `tool.started`（payload 标记 `recovered=true`）或最终
+  `process.exited`，不得静默生成第二个进程；
+* 唯一约束确保 recovery/finalize race 不产生重复 process sequence。
+
+### 5.9 OpenTelemetry（第二阶段）
 
 同时接入可选 OpenTelemetry：
 
@@ -290,7 +578,8 @@ interaction/request
        └── artifact_scan
 ```
 
-重点记录：
+OTel 必须是 optional dependency 和可选配置；exporter 不可用时不能影响工具执行。
+span/event attributes 只记录低基数、已脱敏的字段。重点记录：
 
 * 排队时间
 * 工具运行时间
@@ -301,6 +590,81 @@ interaction/request
 * DB lock 等待时间
 
 默认必须脱敏脚本、路径和用户输入。
+
+推荐指标：
+
+```text
+tool.duration_ms                  histogram
+process.queue_wait_ms             histogram
+process.runtime_ms                histogram
+process.output_bytes              counter
+process.output_truncations        counter
+events.long_poll_wait_ms          histogram
+events.returned                   counter
+events.cursor_expired             counter
+database.lock_wait_ms             histogram
+```
+
+不要把 `workspace_id`、`process_id`、路径或 request ID 作为 metrics label；
+这些高基数字段只适合 trace/log。
+
+### 5.10 实施顺序
+
+建议拆成以下可独立 review 的提交：
+
+1. **Schema + EventStore**：events 表、cursor codec、append/list/wait、retention 单元测试。
+2. **Process lifecycle events**：queued/started/exited，统一 terminal status 和
+   `wait_for_terminal()`。
+3. **替换内部轮询**：迁移 `run_pwsh`、`run_command`、`run_check`，保留公开
+   `get_process_result` 向后兼容。
+4. **输出 cursor 统一**：byte-offset reader、`process.output` coalescing、长输出测试。
+5. **MCP API**：`get_events`、ToolSpec、capabilities、workspace isolation。
+6. **Artifact/check/recovery 事件**：补全跨服务集成点和 restart 测试。
+7. **可选 telemetry**：OTel spans/metrics、脱敏测试和 exporter failure 测试。
+
+第一版完成 1–6 即可验收；第 7 步不阻塞事件流 MVP。
+
+### 5.11 测试要求
+
+单元测试：
+
+* event ID 全局递增，process sequence 单调且不可重复；
+* cursor encode/decode、非法 cursor、过期 cursor；
+* append 后 waiter 被唤醒；
+* 查询与 wait 交界处插入事件不会丢失；
+* spurious wakeup 不产生虚假事件；
+* timeout 返回成功空页；
+* workspace/process filter 不泄漏其他 workspace 事件；
+* payload 大小限制和敏感字段拒绝/脱敏；
+* retention 清理和 discard 清理；
+* terminal event 幂等，cancel/finalize race 只产生一个最终事件。
+
+集成测试：
+
+* `run_pwsh(wait=True)`、`run_command(wait=True)`、`run_check(wait=True)`
+  不再调用 `time.sleep(0.5)`；
+* `wait=False` 后用一次 long poll 收到 `process.exited`；
+* 长进程产生多个 output range，范围连续且最终 offset 与文件一致；
+* PTY 快速小块输出被合并而不丢数据；
+* server restart 后用旧 cursor 继续读取已提交事件；
+* queue timeout、resource exhausted、cancel、shutdown、recovery 均有最终事件；
+* 32 个并发 waiter 不阻塞 MCP event loop；第 33 个收到 retryable
+  `RATE_LIMITED`，且没有 DB busy loop；
+* 旧的 `get_process_result` 和 `read_process_output` 调用继续工作。
+
+### 5.12 验收标准
+
+* [ ] 三个 `wait=True` 工具不再包含固定间隔轮询循环。
+* [ ] 异步进程从启动到终态至少产生 queued、started、exited 事件。
+* [ ] 调用方可以用一个 cursor 和 long poll 连续消费事件。
+* [ ] long poll 超时、server restart、cursor 过期都有确定语义。
+* [ ] process output cursor 使用统一 byte-offset，不会切坏 UTF-8 字符。
+* [ ] 事件按 workspace 隔离，不能订阅其他 workspace 的 process。
+* [ ] 事件 payload 不保存脚本、环境变量值或未脱敏绝对路径。
+* [ ] output/event 数量受 coalescing、page limit 和 retention 控制。
+* [ ] cancel、timeout、resource limit、shutdown 和 recovery 都有唯一终态事件。
+* [ ] 现有 process、PTY、artifact、check 和 report 测试全部通过。
+* [ ] OpenTelemetry 关闭或 exporter 故障时核心功能不受影响。
 
 ---
 

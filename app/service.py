@@ -18,6 +18,7 @@ import yaml
 
 from app.config import BASE_DIR, load_operator_config, load_projects_config
 from app.services.service_state import ServiceStateStore, process_matches
+from app.services.subprocess_utils import no_window_creationflags
 from app.services.supervisor import (
     Supervisor,
     _terminate_process_tree,
@@ -88,7 +89,10 @@ def command_stop(timeout: float, force: bool) -> int:
     return 1
 
 
-def command_doctor(run_tunnel_doctor: bool) -> int:
+def command_doctor(
+    run_tunnel_doctor: bool,
+    check_scheduled_task_action: bool = True,
+) -> int:
     checks: list[dict[str, Any]] = []
 
     def add(name: str, state: str, detail: str) -> None:
@@ -139,6 +143,7 @@ def command_doctor(run_tunnel_doctor: bool) -> int:
             cwd=str(BASE_DIR),
             timeout=5,
             check=False,
+            creationflags=no_window_creationflags(),
         )
         ignored = git_result.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
@@ -198,14 +203,18 @@ def command_doctor(run_tunnel_doctor: bool) -> int:
             errors="replace",
             timeout=10,
             check=False,
-            creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+            creationflags=no_window_creationflags(),
         )
         add(
             "scheduled_task",
             "pass" if query.returncode == 0 else "warning",
             "installed" if query.returncode == 0 else "not installed",
         )
-        if query.returncode == 0 and shutil.which("pwsh"):
+        if (
+            query.returncode == 0
+            and check_scheduled_task_action
+            and shutil.which("pwsh")
+        ):
             task_env = dict(os.environ)
             task_env["GPT_LOCAL_TASK_NAME"] = task_name
             task_env["GPT_LOCAL_PROJECT_ROOT"] = str(BASE_DIR)
@@ -213,9 +222,8 @@ def command_doctor(run_tunnel_doctor: bool) -> int:
                 "$task=Get-ScheduledTask -TaskName $env:GPT_LOCAL_TASK_NAME;"
                 "$action=$task.Actions[0];"
                 "[pscustomobject]@{"
-                "ExecuteMatches=([IO.Path]::GetFileName($action.Execute) -in @('pwsh','pwsh.exe'));"
-                "ArgumentsMatch=($action.Arguments -like '*service-host.ps1*' -and "
-                "$action.Arguments -like '*-WindowStyle Hidden*');"
+                "ExecuteMatches=([IO.Path]::GetFileName($action.Execute) -eq 'pythonw.exe');"
+                "ArgumentsMatch=($action.Arguments.Trim() -eq '-m app.service run');"
                 "WorkingDirectoryMatches=([IO.Path]::GetFullPath($action.WorkingDirectory) "
                 "-eq [IO.Path]::GetFullPath($env:GPT_LOCAL_PROJECT_ROOT))}"
                 "|ConvertTo-Json -Compress"
@@ -229,7 +237,7 @@ def command_doctor(run_tunnel_doctor: bool) -> int:
                 errors="replace",
                 timeout=10,
                 check=False,
-                creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+                creationflags=no_window_creationflags(),
             )
             try:
                 action = json.loads(inspected.stdout)
@@ -244,7 +252,7 @@ def command_doctor(run_tunnel_doctor: bool) -> int:
             add(
                 "scheduled_task_action",
                 "pass" if action_valid else "fail",
-                "hidden service host and working directory verified"
+                "windowless Python host and working directory verified"
                 if action_valid
                 else (
                     "installed task action does not match this project: "
@@ -282,7 +290,7 @@ def command_doctor(run_tunnel_doctor: bool) -> int:
                 errors="replace",
                 timeout=float(config["service"]["startup_timeout_seconds"]),
                 check=False,
-                creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+                creationflags=no_window_creationflags(),
             )
             detail = (tunnel_result.stdout + "\n" + tunnel_result.stderr).strip()
             key = env.get("CONTROL_PLANE_API_KEY", "")
@@ -346,6 +354,7 @@ def build_parser() -> argparse.ArgumentParser:
     stop.add_argument("--force", action="store_true")
     doctor = subparsers.add_parser("doctor", help="run installation and runtime diagnostics")
     doctor.add_argument("--skip-tunnel-doctor", action="store_true")
+    doctor.add_argument("--skip-task-action-check", action="store_true", help=argparse.SUPPRESS)
     subparsers.add_parser("reconcile", help="reconcile persisted runtime state")
     subparsers.add_parser("task-name", help="print the configured scheduled-task name")
     subparsers.add_parser("runtime-config", help="print non-secret lifecycle configuration")
@@ -361,7 +370,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "stop":
         return command_stop(float(args.timeout), bool(args.force))
     if args.command == "doctor":
-        return command_doctor(not bool(args.skip_tunnel_doctor))
+        return command_doctor(
+            not bool(args.skip_tunnel_doctor),
+            not bool(args.skip_task_action_check),
+        )
     if args.command == "reconcile":
         print(json.dumps(reconcile_runtime_state(), ensure_ascii=False, indent=2))
         return 0

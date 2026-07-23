@@ -19,13 +19,23 @@ if (-not $TaskName) {
 }
 
 Write-Host "[install-service] Running preflight checks..."
-$DoctorArgs = @("-m", "app.service", "doctor")
+$DoctorArgs = @("-m", "app.service", "doctor", "--skip-task-action-check")
 if ($SkipTunnelDoctor) {
     $DoctorArgs += "--skip-tunnel-doctor"
 }
 & $PythonPath @DoctorArgs
 if ($LASTEXITCODE -ne 0) {
     throw "Service preflight failed. Fix the failed doctor checks and retry."
+}
+
+$ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($ExistingTask) {
+    Write-Host "[install-service] Stopping the existing service before upgrading it..."
+    & $PythonPath -m app.service stop --timeout 20 --force
+    if ($LASTEXITCODE -ne 0) {
+        throw "Existing service could not be stopped safely."
+    }
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 }
 
 $LegacyTasks = @(
@@ -40,13 +50,13 @@ foreach ($LegacyTask in $LegacyTasks) {
     }
 }
 
-$HostScript = Join-Path $ProjectRoot "scripts\service-host.ps1"
-$PwshPath = (Get-Command pwsh -ErrorAction Stop).Source
-$QuotedHost = '"' + $HostScript + '"'
-$QuotedPython = '"' + $PythonPath + '"'
-$ActionArguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File $QuotedHost -PythonPath $QuotedPython"
+$PythonwPath = Join-Path (Split-Path -Parent $PythonPath) "pythonw.exe"
+if (-not (Test-Path -LiteralPath $PythonwPath -PathType Leaf)) {
+    throw "Windowless Python launcher not found next to python.exe: $PythonwPath"
+}
+$ActionArguments = "-m app.service run"
 $ActionParameters = @{
-    Execute = $PwshPath
+    Execute = $PythonwPath
     Argument = $ActionArguments
     WorkingDirectory = $ProjectRoot
 }
@@ -80,7 +90,7 @@ $RegisterParameters = @{
 Register-ScheduledTask @RegisterParameters | Out-Null
 
 Write-Host "[install-service] Installed task: $TaskName"
-Write-Host "[install-service] Python: $PythonPath"
+Write-Host "[install-service] Windowless Python: $PythonwPath"
 
 if (-not $NoStart) {
     Start-ScheduledTask -TaskName $TaskName

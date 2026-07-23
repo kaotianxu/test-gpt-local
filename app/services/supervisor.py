@@ -27,6 +27,7 @@ from app.services.service_state import (
     process_creation_identity,
     utc_now,
 )
+from app.services.subprocess_utils import no_window_creationflags
 from app.services.workspace_manager import discard_workspace
 from app.storage import database as db
 
@@ -229,7 +230,7 @@ class Supervisor:
 
     def _start_child(self, child: ChildRuntime) -> None:
         logger = self.mcp_log if child.name == "mcp" else self.tunnel_log
-        creation_flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        creation_flags = no_window_creationflags()
         try:
             process = subprocess.Popen(
                 child.command,
@@ -415,7 +416,7 @@ class Supervisor:
                 errors="replace",
                 timeout=float(self.service_cfg["startup_timeout_seconds"]),
                 check=False,
-                creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+                creationflags=no_window_creationflags(),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             self.tunnel.last_error = f"tunnel doctor could not complete: {exc}"
@@ -626,6 +627,7 @@ def _is_registered_worktree(repository: Path, worktree: Path) -> bool:
             errors="replace",
             timeout=10,
             check=False,
+            creationflags=no_window_creationflags(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -647,6 +649,7 @@ def _worktree_is_clean(path: Path) -> bool:
             errors="replace",
             timeout=10,
             check=False,
+            creationflags=no_window_creationflags(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -660,7 +663,7 @@ def _terminate_process_tree(pid: int) -> bool:
         result = subprocess.run(
             ["taskkill", "/PID", str(pid), "/T", "/F"],
             capture_output=True,
-            creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+            creationflags=no_window_creationflags(),
             check=False,
         )
         return result.returncode == 0
@@ -684,7 +687,7 @@ def _listening_process_ids(host: str, port: int) -> set[int] | None:
             errors="replace",
             timeout=5,
             check=False,
-            creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+            creationflags=no_window_creationflags(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None

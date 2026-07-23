@@ -53,7 +53,7 @@ def test_registry_exactly_covers_mcp_tool_surface() -> None:
             )
         )
 
-    assert len(implementation_names) == 33
+    assert len(implementation_names) == 42
     assert TOOL_REGISTRY.names() == implementation_names
 
 

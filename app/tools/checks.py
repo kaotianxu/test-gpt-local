@@ -13,7 +13,6 @@ import asyncio
 import logging
 import os
 import subprocess
-import time
 from pathlib import Path
 from typing import Any
 
@@ -22,14 +21,13 @@ from mcp.types import ToolAnnotations
 
 from app.config import get_process_config, get_project
 from app.services.envelope import error_result, ok_result
+from app.services.event_store import TERMINAL_PROCESS_STATUSES
 from app.services.process_manager import ProcessManager
+from app.services.subprocess_utils import no_window_creationflags
 from app.services.workspace_manager import get_workspace
 from app.storage.idempotency import with_idempotency
 
 log = logging.getLogger(__name__)
-
-_WAIT_POLL_INTERVAL = 0.5
-
 
 def _list_checks(workspace_id: str) -> dict[str, Any]:
     """Return the available checks for the workspace's project."""
@@ -169,31 +167,10 @@ def _run_check(
 
     # ---- 5. Wait (if requested) ----
     if wait:
-        terminal_statuses = {
-            "passed",
-            "failed",
-            "timed_out",
-            "cancelled",
-            "resource_exhausted",
-            "interrupted",
-            "lost",
-            "recovery_required",
-        }
-        deadline = time.monotonic() + timeout + 5
-        while time.monotonic() < deadline:
+        result = pm.wait_for_terminal(process_id, timeout + 5)
+        if result.get("status") not in TERMINAL_PROCESS_STATUSES:
+            pm.cancel(process_id)
             result = pm.get_result(process_id)
-            status = result.get("status", "")
-            if status in terminal_statuses:
-                # Add check-specific metadata.
-                result["check_id"] = check_id
-                result["workspace_id"] = workspace_id
-                if check_cfg.get("result_semantics") == "git_diff_check":
-                    result["git_hygiene"] = _git_hygiene(worktree, result)
-                return ok_result(result, workspace_id=workspace_id)
-            time.sleep(_WAIT_POLL_INTERVAL)
-
-        pm.cancel(process_id)
-        result = pm.get_result(process_id)
         result["check_id"] = check_id
         result["workspace_id"] = workspace_id
         if check_cfg.get("result_semantics") == "git_diff_check":
@@ -222,6 +199,7 @@ def _git_hygiene(worktree: Path, process_result: dict[str, Any]) -> dict[str, An
             encoding="utf-8",
             errors="replace",
             timeout=30,
+            creationflags=no_window_creationflags(),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         return {"error": str(exc)}

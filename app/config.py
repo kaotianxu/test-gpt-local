@@ -75,6 +75,17 @@ def load_operator_config(path: Path | None = None) -> dict[str, Any]:
     artifacts.setdefault("cleanup_on_workspace_discard", True)
     artifacts.setdefault("max_discovery_files", 100)
 
+    # --- durable event stream defaults ---
+    events = cfg.setdefault("events", {})
+    events.setdefault("enabled", True)
+    events.setdefault("retention_days", 7)
+    events.setdefault("max_events_per_workspace", 50_000)
+    events.setdefault("max_payload_bytes", 16_384)
+    events.setdefault("max_page_size", 500)
+    events.setdefault("max_wait_seconds", 25.0)
+    events.setdefault("max_waiters", 32)
+    events.setdefault("output_coalesce_ms", 100)
+
     # --- logging defaults ---
     log = cfg.setdefault("logging", {})
     log.setdefault("level", "INFO")
@@ -149,6 +160,20 @@ def _validate_operator_config(cfg: dict[str, Any]) -> None:
     for key in ("cpu_time_seconds", "memory_bytes", "max_processes", "max_disk_bytes"):
         if int(process[key]) < 0:
             raise ValueError(f"process.{key} must not be negative")
+
+    events = cfg["events"]
+    for key in (
+        "retention_days",
+        "max_events_per_workspace",
+        "max_payload_bytes",
+        "max_page_size",
+        "max_waiters",
+        "output_coalesce_ms",
+    ):
+        if int(events[key]) < (0 if key == "retention_days" else 1):
+            raise ValueError(f"events.{key} is below its minimum")
+    if float(events["max_wait_seconds"]) <= 0:
+        raise ValueError("events.max_wait_seconds must be positive")
 
     service = cfg["service"]
     for key in (
@@ -233,6 +258,12 @@ def get_files_config() -> dict[str, Any]:
     """Return the file access configuration block."""
     cfg = load_operator_config()
     return cast(dict[str, Any], cfg["files"])
+
+
+def get_events_config() -> dict[str, Any]:
+    """Return durable event-stream configuration."""
+    cfg = load_operator_config()
+    return cast(dict[str, Any], cfg["events"])
 
 
 def get_image_config() -> dict[str, Any]:

@@ -39,6 +39,7 @@ from mcp.types import ToolAnnotations
 
 from app.services.envelope import error_result, ok_result
 from app.services.path_guard import is_denied, resolve_within
+from app.services.subprocess_utils import no_window_creationflags
 from app.services.workspace_manager import get_workspace
 from app.storage import database as db
 from app.storage.idempotency import with_idempotency
@@ -717,6 +718,7 @@ def _run_git(
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
+            creationflags=no_window_creationflags(),
         )
     except FileNotFoundError:
         return {"error": "git executable not found"}

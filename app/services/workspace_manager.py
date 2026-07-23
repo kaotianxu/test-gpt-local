@@ -18,6 +18,7 @@ from typing import Any
 
 from app.config import get_project, load_operator_config
 from app.services.process_manager import ProcessManager
+from app.services.subprocess_utils import no_window_creationflags
 from app.storage import database as db
 
 # Workspace IDs are short, URL-safe, and not user-controlled. Format:
@@ -75,6 +76,7 @@ def _run_git(
         encoding="utf-8",
         errors="replace",
         check=check,
+        creationflags=no_window_creationflags(),
     )
 
 

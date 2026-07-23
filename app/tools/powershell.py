@@ -16,8 +16,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 import subprocess
-import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -26,16 +26,15 @@ from mcp.types import ToolAnnotations
 
 from app.config import get_process_config, get_project
 from app.services.envelope import error_result, ok_result
+from app.services.event_store import TERMINAL_PROCESS_STATUSES
 from app.services.path_guard import is_denied, resolve_within
 from app.services.process_manager import ProcessManager
+from app.services.subprocess_utils import no_window_creationflags
 from app.services.workspace_manager import get_workspace
 from app.storage.idempotency import with_idempotency
 
 log = logging.getLogger(__name__)
-
-# Poll interval (seconds) when waiting for a process to finish.
-_WAIT_POLL_INTERVAL = 0.5
-
+_OUTPUT_CURSOR_RE = re.compile(r"^out1_([0-9a-f]{1,16})$")
 
 def _resolve_pwsh(project: dict[str, Any]) -> str:
     """Return the pwsh executable path from the project config, or the default."""
@@ -54,6 +53,7 @@ def _git_status(worktree: Path) -> str | None:
             encoding="utf-8",
             errors="replace",
             timeout=15,
+            creationflags=no_window_creationflags(),
         )
         return result.stdout.strip() or None
     except Exception:
@@ -139,32 +139,10 @@ def _run_pwsh(
 
     # ---- 5. Wait (if requested) ----
     if wait:
-        # Poll until the status changes from "running"/"queued".
-        terminal_statuses = {
-            "passed",
-            "failed",
-            "timed_out",
-            "cancelled",
-            "resource_exhausted",
-            "interrupted",
-            "lost",
-            "recovery_required",
-        }
-        deadline = time.monotonic() + timeout + 5  # extra buffer
-        while time.monotonic() < deadline:
+        result = pm.wait_for_terminal(process_id, timeout + 5)
+        if result.get("status") not in TERMINAL_PROCESS_STATUSES:
+            pm.cancel(process_id)
             result = pm.get_result(process_id)
-            status = result.get("status", "")
-            if status in terminal_statuses:
-                # Add git status after.
-                result["git_status_after"] = _git_status(worktree)
-                return ok_result(result, workspace_id=workspace_id)
-            # Short sleep to avoid busy-waiting.
-            time.sleep(_WAIT_POLL_INTERVAL)
-
-        # Timed out waiting (should not normally happen since the watchdog
-        # handles the timeout, but guard against races).
-        pm.cancel(process_id)
-        result = pm.get_result(process_id)
         result["git_status_after"] = _git_status(worktree)
         return ok_result(result, workspace_id=workspace_id)
 
@@ -230,19 +208,28 @@ def _read_process_output(
     stream: str = "stdout",
     offset: int = 0,
     max_chars: int = 50000,
+    cursor: str | None = None,
 ) -> dict[str, Any]:
     """Read a segment of a process's output file.
 
     Args:
         process_id: The process ID returned by ``run_pwsh``.
         stream: Which stream to read — ``"stdout"`` or ``"stderr"``.
-        offset: Character offset from the start of the file.
-        max_chars: Maximum number of characters to return.
+        offset: Legacy byte offset from the start of the file.
+        max_chars: Maximum number of UTF-8 bytes to return.
+        cursor: Preferred opaque byte cursor, overriding ``offset``.
     """
     if stream not in ("stdout", "stderr"):
         return error_result(
             "INVALID_INPUT", f"stream must be 'stdout' or 'stderr', got: {stream!r}"
         )
+    if cursor is not None:
+        match = _OUTPUT_CURSOR_RE.fullmatch(cursor)
+        if match is None:
+            return error_result("INVALID_CURSOR", "invalid process output cursor")
+        offset = int(match.group(1), 16)
+    if offset < 0:
+        return error_result("INVALID_INPUT", "offset must not be negative")
 
     from app.storage import database as db
 
@@ -269,8 +256,9 @@ def _read_process_output(
             workspace_id=record.get("workspace_id"),
         )
 
+    max_bytes = max(1, min(max_chars, 200000))
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        total, start, content, consumed = _read_utf8_bytes(path, offset, max_bytes)
     except OSError as exc:
         return error_result(
             "INTERNAL_ERROR",
@@ -278,25 +266,54 @@ def _read_process_output(
             extra={"process_id": process_id, "stream": stream},
         )
 
-    total = len(text)
-    offset = max(0, min(offset, total - 1)) if total > 0 else 0
-    max_chars = max(1, min(max_chars, 200000))
-    content = text[offset : offset + max_chars]
-    truncated = (offset + max_chars) < total
+    next_offset = start + consumed
+    truncated = next_offset < total
 
     return ok_result(
         {
             "process_id": process_id,
             "stream": stream,
-            "offset": offset,
+            "offset": start,
+            "offset_unit": "bytes",
             "content": content,
+            "total_bytes": total,
             "total_chars": total,
             "truncated": truncated,
         },
         workspace_id=record.get("workspace_id"),
         truncated=truncated,
-        next_cursor=str(offset + len(content)) if truncated else None,
+        next_cursor=f"out1_{next_offset:x}" if truncated else None,
     )
+
+
+def _read_utf8_bytes(path: Path, offset: int, max_bytes: int) -> tuple[int, int, str, int]:
+    """Seek and decode a UTF-8 segment without returning a split code point."""
+    total = path.stat().st_size
+    start = min(offset, total)
+    with path.open("rb") as handle:
+        if start:
+            handle.seek(start)
+            while start < total:
+                marker = handle.read(1)
+                if not marker or marker[0] & 0xC0 != 0x80:
+                    break
+                start += 1
+            handle.seek(start)
+        data = handle.read(max_bytes)
+        if not data:
+            return total, start, "", 0
+        while data:
+            try:
+                return total, start, data.decode("utf-8"), len(data)
+            except UnicodeDecodeError as exc:
+                if exc.end == len(data) and exc.reason == "unexpected end of data":
+                    data = data[: exc.start]
+                    continue
+                return total, start, data.decode("utf-8", errors="replace"), len(data)
+        # A very small byte budget can contain only part of one code point.
+        handle.seek(start)
+        extended = handle.read(min(4, total - start))
+        return total, start, extended.decode("utf-8", errors="replace"), len(extended)
 
 
 def _cancel_process(process_id: str) -> dict[str, Any]:
@@ -486,8 +503,9 @@ def register_tools(mcp: FastMCP) -> None:
             "Parameters:\n"
             "- ``process_id``: the process ID or output_artifact_id.\n"
             '- ``stream``: ``"stdout"`` (default) or ``"stderr"``.\n'
-            "- ``offset``: character offset from the start of the file.\n"
-            "- ``max_chars``: maximum characters to return (default 50000)."
+            "- ``offset``: legacy UTF-8 byte offset from the start of the file.\n"
+            "- ``cursor``: preferred opaque cursor returned by the previous page.\n"
+            "- ``max_chars``: maximum UTF-8 bytes to return (default 50000)."
         ),
         annotations=ToolAnnotations(
             readOnlyHint=True,
@@ -501,14 +519,16 @@ def register_tools(mcp: FastMCP) -> None:
         stream: str = "stdout",
         offset: int = 0,
         max_chars: int = 50000,
+        cursor: str | None = None,
     ) -> dict[str, object]:
         """Read a segment of a process output file.
 
         Args:
             process_id: The process ID (also used as output_artifact_id).
             stream: ``\"stdout\"`` or ``\"stderr\"``.
-            offset: Character offset from the start of the file.
-            max_chars: Maximum characters to return.
+            offset: Legacy UTF-8 byte offset from the start of the file.
+            max_chars: Maximum UTF-8 bytes to return.
+            cursor: Preferred opaque cursor returned by the previous page.
         """
         log.info(
             "read_process_output process_id=%s stream=%s offset=%d max_chars=%d",
@@ -517,4 +537,4 @@ def register_tools(mcp: FastMCP) -> None:
             offset,
             max_chars,
         )
-        return _read_process_output(process_id, stream, offset, max_chars)
+        return _read_process_output(process_id, stream, offset, max_chars, cursor)

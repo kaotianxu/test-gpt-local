@@ -168,6 +168,10 @@ def _global_key(_: Mapping[str, Any]) -> str:
     return "global:operator"
 
 
+def _no_key(_: Mapping[str, Any]) -> None:
+    return None
+
+
 def _read_spec(
     name: str,
     *,
@@ -225,6 +229,13 @@ def _default_specs() -> tuple[ToolSpec, ...]:
         "git_status",
         "list_artifacts",
         "list_checks",
+        "list_symbols",
+        "find_definition",
+        "find_references",
+        "find_implementations",
+        "get_call_hierarchy",
+        "get_diagnostics",
+        "get_changed_symbols",
         "read_files",
         "search_code",
         "view_image",
@@ -233,6 +244,8 @@ def _default_specs() -> tuple[ToolSpec, ...]:
 
     specs = [_read_spec(name, key=_global_key) for name in sorted(global_reads)]
     specs.extend(_read_spec(name) for name in sorted(workspace_reads))
+    specs.append(_read_spec("get_events", key=_no_key))
+    specs.append(_read_spec("subscribe_process", key=_no_key))
     specs.extend(_read_spec(name, key=_process_key) for name in sorted(process_reads))
     specs.append(_read_spec("get_project_status", key=_project_key))
     specs.extend(

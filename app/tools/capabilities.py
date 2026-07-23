@@ -15,6 +15,7 @@ from mcp.types import ToolAnnotations
 
 from app.config import (
     get_artifact_config,
+    get_events_config,
     get_files_config,
     get_process_config,
     load_operator_config,
@@ -45,6 +46,7 @@ def _build_capabilities() -> dict[str, object]:
     proc_cfg = get_process_config()
     files_cfg = get_files_config()
     artifact_cfg = get_artifact_config()
+    event_cfg = get_events_config()
     ws_cfg = load_operator_config().get("workspace", {})
 
     specs = list_tool_specs()
@@ -70,6 +72,17 @@ def _build_capabilities() -> dict[str, object]:
             "update_workspace_plan",
             "update_workspace_plan_step",
         },
+        "supports_code_intelligence": {
+            "list_symbols",
+            "find_definition",
+            "find_references",
+            "find_implementations",
+            "get_call_hierarchy",
+            "get_diagnostics",
+            "get_changed_symbols",
+        },
+        "supports_event_stream": {"get_events", "subscribe_process"},
+        "supports_event_long_poll": {"get_events", "subscribe_process"},
     }
     caps = {name: required <= tool_names for name, required in requirements.items()}
     caps["supports_idempotency"] = any(
@@ -92,6 +105,11 @@ def _build_capabilities() -> dict[str, object]:
             "max_artifact_discovery_files": int(
                 artifact_cfg.get("max_discovery_files", 100)
             ),
+            "event_retention_days": int(event_cfg["retention_days"]),
+            "max_events_per_workspace": int(event_cfg["max_events_per_workspace"]),
+            "max_event_page_size": int(event_cfg["max_page_size"]),
+            "max_event_wait_seconds": int(event_cfg["max_wait_seconds"]),
+            "max_event_waiters": int(event_cfg["max_waiters"]),
         },
     }
 

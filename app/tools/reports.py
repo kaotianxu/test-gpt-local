@@ -16,10 +16,12 @@ from app.config import get_project
 from app.services import artifact_registry, workspace_plan
 from app.services.envelope import error_result, ok_result
 from app.services.process_manager import ProcessManager
+from app.services.subprocess_utils import no_window_creationflags
 from app.services.workspace_manager import get_workspace, list_workspaces
 from app.storage import database as db
 
 _MAX_OUTPUT = 200_000
+_REPORT_PROCESS_OUTPUT_CHARS = 4_000
 _TEST_STEP_RE = re.compile(
     r"\b(test|tests|testing|check|checks|pytest|playwright)\b|测试|验收", re.I
 )
@@ -86,6 +88,7 @@ def _run_git(path: Path, args: list[str]) -> dict[str, Any]:
             encoding="utf-8",
             errors="replace",
             timeout=30,
+            creationflags=no_window_creationflags(),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         return {"error": str(exc)}
@@ -103,6 +106,32 @@ def _parse_porcelain(output: str) -> list[dict[str, str]]:
         if len(line) >= 3:
             entries.append({"status_code": line[:2], "path": line[3:]})
     return entries
+
+
+def _process_report_result(
+    process_manager: ProcessManager,
+    process: dict[str, Any],
+) -> dict[str, Any]:
+    """Return bounded process evidence suitable for the aggregate report.
+
+    Full process output and artifact metadata remain available from the
+    dedicated process and artifact tools. Embedding them for every process can
+    make this report exceed the connector response limit and surface as an
+    upstream HTTP 502 instead of a tool envelope.
+    """
+    result = process_manager.get_result(
+        process["process_id"],
+        tail_chars=_REPORT_PROCESS_OUTPUT_CHARS,
+    )
+    artifacts = result.pop("artifacts", [])
+    result["artifact_ids"] = [
+        artifact["artifact_id"]
+        for artifact in artifacts
+        if isinstance(artifact, dict) and isinstance(artifact.get("artifact_id"), str)
+    ]
+    result["tool_name"] = process["tool_name"]
+    result["script_preview"] = process.get("script_preview")
+    return result
 
 
 def _get_project_status(project_id: str) -> dict[str, Any]:
@@ -160,9 +189,7 @@ def _get_workspace_report(workspace_id: str) -> dict[str, Any]:
     process_results: list[dict[str, Any]] = []
     latest_checks: dict[str, dict[str, Any]] = {}
     for process in db.list_processes(workspace_id):
-        result = process_manager.get_result(process["process_id"])
-        result["tool_name"] = process["tool_name"]
-        result["script_preview"] = process.get("script_preview")
+        result = _process_report_result(process_manager, process)
         process_results.append(result)
         tool_name = str(process["tool_name"])
         if tool_name.startswith("run_check:"):

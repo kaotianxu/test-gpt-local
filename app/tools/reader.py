@@ -19,6 +19,7 @@ from mcp.types import ToolAnnotations
 from app.config import get_files_config
 from app.services.envelope import error_result, ok_result
 from app.services.path_guard import is_denied, resolve_within
+from app.services.subprocess_utils import no_window_creationflags
 from app.services.workspace_manager import get_workspace
 
 log = logging.getLogger(__name__)
@@ -85,6 +86,7 @@ def _read_item(worktree: Path, item: dict[str, Any], remaining: int) -> dict[str
             encoding="utf-8",
             errors="replace",
             timeout=15,
+            creationflags=no_window_creationflags(),
         )
         if blob_result.returncode == 0:
             git_blob = blob_result.stdout.strip() or None

@@ -50,6 +50,16 @@ def _get_connection() -> sqlite3.Connection:
     return cast(sqlite3.Connection, _local.conn)
 
 
+def connect() -> sqlite3.Connection:
+    """Return the active database connection for the current thread."""
+    return _get_connection()
+
+
+def database_identity() -> str:
+    """Return a stable identity for the active database used by local notifiers."""
+    return str(_effective_db_path().resolve())
+
+
 class Database:
     """An isolated database handle suitable for dependency injection.
 
@@ -220,6 +230,30 @@ def init_db(db_path: str | Path | None = None) -> None:
             ON plans(workspace_id);
         CREATE INDEX IF NOT EXISTS idx_plan_step_status
             ON plan_steps(plan_id, status);
+
+        CREATE TABLE IF NOT EXISTS events (
+            event_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id     TEXT,
+            workspace_id   TEXT,
+            process_id     TEXT,
+            event_type     TEXT NOT NULL,
+            sequence       INTEGER,
+            payload_json   TEXT NOT NULL DEFAULT '{}',
+            created_at     TEXT NOT NULL,
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_workspace_event
+            ON events(workspace_id, event_id);
+        CREATE INDEX IF NOT EXISTS idx_events_process_event
+            ON events(process_id, event_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_events_process_sequence
+            ON events(process_id, sequence)
+            WHERE process_id IS NOT NULL AND sequence IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS event_retention_state (
+            workspace_id   TEXT PRIMARY KEY,
+            expired_through INTEGER NOT NULL DEFAULT 0
+        );
     """)
     workspace_columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(workspaces)").fetchall()
@@ -395,6 +429,11 @@ def delete_workspace(workspace_id: str) -> bool:
             )
             conn.execute("DELETE FROM plans WHERE workspace_id = ?", (workspace_id,))
             conn.execute("DELETE FROM artifacts WHERE workspace_id = ?", (workspace_id,))
+            conn.execute("DELETE FROM events WHERE workspace_id = ?", (workspace_id,))
+            conn.execute(
+                "DELETE FROM event_retention_state WHERE workspace_id = ?",
+                (workspace_id,),
+            )
             conn.execute("DELETE FROM processes WHERE workspace_id = ?", (workspace_id,))
             conn.execute("DELETE FROM operations WHERE workspace_id = ?", (workspace_id,))
             cursor = conn.execute(
