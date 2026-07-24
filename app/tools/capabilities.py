@@ -15,6 +15,7 @@ from mcp.types import ToolAnnotations
 
 from app.config import (
     get_artifact_config,
+    get_change_set_config,
     get_events_config,
     get_files_config,
     get_process_config,
@@ -47,6 +48,7 @@ def _build_capabilities() -> dict[str, object]:
     files_cfg = get_files_config()
     artifact_cfg = get_artifact_config()
     event_cfg = get_events_config()
+    change_set_cfg = get_change_set_config()
     ws_cfg = load_operator_config().get("workspace", {})
 
     specs = list_tool_specs()
@@ -83,6 +85,15 @@ def _build_capabilities() -> dict[str, object]:
         },
         "supports_event_stream": {"get_events", "subscribe_process"},
         "supports_event_long_poll": {"get_events", "subscribe_process"},
+        "supports_change_sets": {
+            "begin_change_set",
+            "stage_patch",
+            "stage_replace",
+            "validate_change_set",
+            "commit_change_set",
+            "rollback_change_set",
+            "get_change_set",
+        },
     }
     caps = {name: required <= tool_names for name, required in requirements.items()}
     caps["supports_idempotency"] = any(
@@ -111,6 +122,14 @@ def _build_capabilities() -> dict[str, object]:
             "max_event_wait_seconds": int(event_cfg["max_wait_seconds"]),
             "max_event_waiters": int(event_cfg["max_waiters"]),
         },
+        "change_set_limits": {
+            "max_operations": int(change_set_cfg["max_operations"]),
+            "max_changed_files": int(change_set_cfg["max_changed_files"]),
+            "max_staging_bytes": int(change_set_cfg["max_staging_bytes"]),
+            "ttl_hours": int(change_set_cfg["ttl_hours"]),
+        },
+        "change_set_file_types": ["utf8_regular_file"],
+        "supports_change_set_validators": False,
     }
 
 

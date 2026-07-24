@@ -18,6 +18,7 @@ from app.config import (
     get_server_bind,
     load_operator_config,
 )
+from app.services.change_set_store import cleanup_expired, reconcile_incomplete
 from app.services.process_manager import ProcessManager
 from app.services.process_recovery import recover_processes
 from app.services.tool_registry import RegisteredToolMCP
@@ -26,6 +27,7 @@ from app.storage.database import Database
 from app.tools import (
     artifacts,
     capabilities,
+    change_sets,
     checks,
     code_intelligence,
     events,
@@ -89,6 +91,21 @@ def create_app() -> FastMCP:
             recovery["interrupted"],
             recovery["lost"],
             recovery["recovery_required"],
+        )
+    change_set_recovery = reconcile_incomplete()
+    if any(change_set_recovery.values()):
+        log.warning(
+            "change-set recovery: committed=%d rolled_back=%d recovery_required=%d",
+            change_set_recovery["committed"],
+            change_set_recovery["rolled_back"],
+            change_set_recovery["recovery_required"],
+        )
+    change_set_cleanup = cleanup_expired()
+    if any(change_set_cleanup.values()):
+        log.info(
+            "change-set cleanup: expired=%d cleaned=%d",
+            change_set_cleanup["expired"],
+            change_set_cleanup["cleaned"],
         )
 
     # ---- Configure logging ----
@@ -176,6 +193,7 @@ def create_app() -> FastMCP:
 
     # Phase 2: patch application.
     patcher.register_tools(tool_mcp)
+    change_sets.register_tools(tool_mcp)
 
     # Phase 3: PowerShell execution.
     powershell.register_tools(tool_mcp)

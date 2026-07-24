@@ -164,6 +164,25 @@ def _process_key(inputs: Mapping[str, Any]) -> str | None:
     return f"process:{value}" if value else None
 
 
+def _change_set_workspace_id(inputs: Mapping[str, Any]) -> str | None:
+    value = inputs.get("change_set_id")
+    if not isinstance(value, str) or not value:
+        return None
+    from app.services.change_set_store import workspace_id_for
+
+    return workspace_id_for(value)
+
+
+def _change_set_key(inputs: Mapping[str, Any]) -> str | None:
+    value = inputs.get("change_set_id")
+    return f"change_set:{value}" if value else None
+
+
+def _change_set_workspace_key(inputs: Mapping[str, Any]) -> str | None:
+    workspace_id = _change_set_workspace_id(inputs)
+    return f"workspace:{workspace_id}" if workspace_id else _change_set_key(inputs)
+
+
 def _global_key(_: Mapping[str, Any]) -> str:
     return "global:operator"
 
@@ -244,6 +263,7 @@ def _default_specs() -> tuple[ToolSpec, ...]:
 
     specs = [_read_spec(name, key=_global_key) for name in sorted(global_reads)]
     specs.extend(_read_spec(name) for name in sorted(workspace_reads))
+    specs.append(_read_spec("get_change_set", key=_change_set_key))
     specs.append(_read_spec("get_events", key=_no_key))
     specs.append(_read_spec("subscribe_process", key=_no_key))
     specs.extend(_read_spec(name, key=_process_key) for name in sorted(process_reads))
@@ -261,6 +281,28 @@ def _default_specs() -> tuple[ToolSpec, ...]:
             ),
             _write_spec("apply_patch", effects=frozenset({Effect.WRITE, Effect.GIT})),
             _write_spec("replace_text", effects=frozenset({Effect.WRITE, Effect.GIT})),
+            _write_spec(
+                "begin_change_set",
+                effects=frozenset({Effect.WRITE, Effect.GIT}),
+            ),
+            _write_spec(
+                "stage_patch",
+                effects=frozenset({Effect.WRITE, Effect.GIT}),
+                key=_change_set_key,
+            ),
+            _write_spec("stage_replace", key=_change_set_key),
+            _write_spec(
+                "validate_change_set",
+                effects=frozenset({Effect.READ, Effect.WRITE, Effect.GIT}),
+                key=_change_set_key,
+            ),
+            _write_spec(
+                "commit_change_set",
+                effects=frozenset({Effect.WRITE, Effect.GIT}),
+                key=_change_set_workspace_key,
+                idempotency=IdempotencyPolicy.REQUIRED,
+            ),
+            _write_spec("rollback_change_set", key=_change_set_key),
             _write_spec(
                 "run_pwsh",
                 effects=frozenset({Effect.WRITE, Effect.EXECUTE, Effect.NETWORK}),
@@ -379,17 +421,37 @@ def _validate_inputs(inputs: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _workspace_preflight(inputs: Mapping[str, Any]) -> dict[str, Any] | None:
-    workspace_id = inputs.get("workspace_id")
+def _workspace_preflight(
+    spec: ToolSpec, inputs: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    workspace_id = inputs.get("workspace_id") or _change_set_workspace_id(inputs)
     if not isinstance(workspace_id, str):
         return None
-    if get_workspace(workspace_id) is not None:
-        return None
-    return error_result(
-        "WORKSPACE_NOT_FOUND",
-        f"workspace not found: {workspace_id}",
-        workspace_id=workspace_id,
-    )
+    if get_workspace(workspace_id) is None:
+        return error_result(
+            "WORKSPACE_NOT_FOUND",
+            f"workspace not found: {workspace_id}",
+            workspace_id=workspace_id,
+        )
+    if Effect.WRITE in spec.effects and spec.name not in {
+        "commit_change_set",
+        "rollback_change_set",
+    }:
+        from app.storage import database as db
+
+        row = db.connect().execute(
+            """SELECT change_set_id FROM change_sets
+               WHERE workspace_id=? AND status='recovery_required' LIMIT 1""",
+            (workspace_id,),
+        ).fetchone()
+        if row is not None:
+            return error_result(
+                "CHANGE_SET_RECOVERY_REQUIRED",
+                "workspace writes are blocked until change-set recovery is resolved",
+                workspace_id=workspace_id,
+                extra={"change_set_id": row["change_set_id"]},
+            )
+    return None
 
 
 def _input_summary(inputs: Mapping[str, Any]) -> str:
@@ -565,7 +627,7 @@ async def execute_tool(
     spec = get_tool_spec(spec_or_name) if isinstance(spec_or_name, str) else spec_or_name
     request_id = generate_request_id()
     started = time.monotonic()
-    workspace_value = inputs.get("workspace_id")
+    workspace_value = inputs.get("workspace_id") or _change_set_workspace_id(inputs)
     workspace_id = workspace_value if isinstance(workspace_value, str) else None
     summary = input_summary or _input_summary(inputs)
 
@@ -628,7 +690,7 @@ async def execute_tool(
                 "idempotent_replay",
             )
 
-    preflight = _workspace_preflight(inputs)
+    preflight = _workspace_preflight(spec, inputs)
     if preflight is not None:
         return audited(_normalise_result(preflight, request_id, workspace_id))
 

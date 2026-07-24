@@ -680,13 +680,18 @@ database.lock_wait_ms             histogram
 * exact text replacement
 * 原子单文件写入
 
-但多文件任务仍可能出现：
+需要先澄清：一次 `apply_patch()` 本身已经可以包含多个文件，`git apply --check`
+也会在真正修改前检查整个 patch。因此本节主要解决的不是“一个 multi-file patch
+内部的第四个文件失败”，而是一个任务由多次独立修改调用组成时的事务边界，例如：
 
-1. 修改前三个文件成功。
-2. 第四个文件失败。
-3. workspace 留在半完成状态。
+1. 第一次 `replace_text()` 成功。
+2. 第二次 `apply_patch()` 成功。
+3. 第三次修改因 stale hash、patch conflict 或 validator 失败。
+4. workspace 已经留下前两次修改，调用方只能自行推断和回滚。
 
-建议增加事务式 API：
+### 6.1 第一版目标、语义和非目标
+
+第一版提供一个 workspace 级、显式生命周期的 Change Set：
 
 ```text
 begin_change_set(workspace_id)
@@ -695,17 +700,547 @@ stage_replace(change_set_id, ...)
 validate_change_set(change_set_id)
 commit_change_set(change_set_id)
 rollback_change_set(change_set_id)
+get_change_set(change_set_id)
 ```
 
-底层可通过临时 Git index、临时 tree、额外 worktree 或文件 snapshot 实现。
+保证：
 
-还可以加入：
+* `stage_*` 只修改隔离的 staging tree，不修改真实 workspace。
+* 多个 stage 操作按 `ordinal` 顺序作用于同一个 staging tree，因此后一个操作可以基于
+  前一个操作的结果。
+* `validate_change_set()` 成功后产生不可歧义的 `validated_digest` 和 after tree hash。
+* `commit_change_set()` 在 workspace 独占写锁中完成 preflight、应用、验证和收尾。
+* commit 前发现 workspace 已变化时，不写入任何文件，返回稳定的
+  `CHANGE_SET_CONFLICT`。
+* commit 中途失败时，根据 before snapshot 恢复所有 touched paths。
+* server crash 后通过持久化 journal 判定 committed、rolled_back 或
+  `recovery_required`，不能静默重放。
+* commit 和 rollback 都支持安全重试。
 
-* 修改后自动 formatter
-* 只对 changed files 运行 lint
-* validation 失败时自动 rollback
-* 返回 before/after tree hash
-* AST-aware rename/import edit
+这里的“原子”定义为 **failure atomicity**：调用成功时整组修改都存在；调用失败时尽力
+恢复到 before 状态。普通工具调用在 commit 期间不能观察到中间状态。
+
+不能宣称多个独立文件具有操作系统级瞬时可见性。Windows/POSIX 都没有跨多个路径的
+通用原子替换事务，workspace 外部进程仍可能在极短时间内看到部分文件已经替换。
+第一版也不尝试：
+
+* 跨 workspace 的 Change Set；
+* 在 Change Set 中创建 Git commit、修改真实 Git index 或切换 branch；
+* staging 任意 shell command；
+* 二进制文件、submodule、symlink、ignored 文件或 workspace 外路径；
+* 在 commit 后再运行 formatter，然后尝试回滚 formatter；
+* AST-aware rename/import edit。
+
+`apply_patch` 和 `replace_text` 继续保留。小型单次编辑无需强制创建 Change Set。
+
+### 6.2 状态机
+
+状态固定为：
+
+```text
+open
+  ├── stage_* ───────────────→ open
+  ├── validate ──────────────→ validated
+  ├── rollback ──────────────→ rolled_back
+  └── expire ────────────────→ expired
+
+validated
+  ├── stage_* ───────────────→ open
+  ├── validate ──────────────→ validated
+  ├── commit ────────────────→ committing → committed
+  └── rollback ──────────────→ rolled_back
+
+committing
+  ├── recovery confirms after tree ──→ committed
+  ├── recovery restores before tree ─→ rolled_back
+  └── state cannot be proven ────────→ recovery_required
+```
+
+规则：
+
+* `stage_*` 后必须清除旧的 `validated_digest`、after tree hash 和 validation result。
+* 只有 `validated` 可以 commit；未验证直接返回 `CHANGE_SET_NOT_VALIDATED`。
+* `committed`、`rolled_back`、`expired` 是正常终态。
+* `recovery_required` 是保护性终态；在人工检查或显式恢复前，拒绝该 workspace 的
+  后续写操作，读取和 diff 仍允许。
+* 不跨 MCP 调用长期持有内存锁。并发安全依赖状态条件更新、staging lock、
+  commit 时的 workspace 写锁和 optimistic conflict check。
+* 第一版每个 workspace 最多一个非终态 Change Set。使用 SQLite partial unique
+  index 保证，而不是只在 Python 中先查再插入。
+* Change Set 默认 24 小时过期。`committing` 和 `recovery_required` 不能由普通
+  retention job 自动删除。
+
+### 6.3 数据模型和磁盘布局
+
+增加数据库表：
+
+```sql
+CREATE TABLE change_sets (
+    change_set_id       TEXT PRIMARY KEY,
+    workspace_id        TEXT NOT NULL,
+    explanation         TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    revision            INTEGER NOT NULL DEFAULT 1,
+    base_head           TEXT NOT NULL,
+    before_tree_hash    TEXT NOT NULL,
+    staged_digest       TEXT,
+    validated_digest    TEXT,
+    after_tree_hash     TEXT,
+    commit_phase        TEXT,
+    error_code          TEXT,
+    error_message       TEXT,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    validated_at        TEXT,
+    committed_at        TEXT,
+    closed_at           TEXT,
+    expires_at          TEXT NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id)
+);
+
+CREATE UNIQUE INDEX idx_change_sets_one_active_workspace
+    ON change_sets(workspace_id)
+    WHERE status IN ('open', 'validated', 'committing', 'recovery_required');
+
+CREATE TABLE change_set_operations (
+    change_set_id       TEXT NOT NULL,
+    operation_id        TEXT NOT NULL,
+    ordinal             INTEGER NOT NULL,
+    operation_type      TEXT NOT NULL,
+    input_sha256        TEXT NOT NULL,
+    payload_ref         TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    PRIMARY KEY (change_set_id, operation_id),
+    UNIQUE (change_set_id, ordinal),
+    FOREIGN KEY (change_set_id) REFERENCES change_sets(change_set_id)
+);
+
+CREATE TABLE change_set_files (
+    change_set_id       TEXT NOT NULL,
+    path                TEXT NOT NULL,
+    change_type         TEXT NOT NULL,
+    before_exists       INTEGER NOT NULL,
+    before_sha256       TEXT,
+    before_mode         INTEGER,
+    after_exists        INTEGER NOT NULL,
+    after_sha256        TEXT,
+    after_mode          INTEGER,
+    PRIMARY KEY (change_set_id, path),
+    FOREIGN KEY (change_set_id) REFERENCES change_sets(change_set_id)
+);
+```
+
+大 patch、源文件 snapshot 和生成的 diff 不直接存入 SQLite。建议磁盘布局：
+
+```text
+data/change_sets/<change_set_id>/
+  manifest.json
+  journal.json
+  operations/0001.patch
+  operations/0002.replace.json
+  staging/
+  rollback/
+  final.patch
+```
+
+要求：
+
+* 目录必须位于 operator data directory，不放在 workspace 内，避免污染 Git status。
+* `change_set_id` 只能由 server 生成，不能直接拼接用户输入形成路径。
+* `payload_ref` 必须解析到该 Change Set 目录内。
+* snapshot、operation payload 和 final diff 使用 operator 本地文件权限；audit/event
+  只记录 hash、大小和 workspace-relative path，不记录源码正文。
+* `journal.json` 使用 write-to-temp + `os.replace()`，每个 commit phase 落盘后再进入
+  下一阶段。
+* 数据库保存控制状态，磁盘 journal 保存文件事务恢复所需的信息；两者不一致时以
+  实际 before/after hash 和 journal phase 进行 reconciliation，不能只相信 DB status。
+
+### 6.4 隔离 staging tree 的实现
+
+建议第一版使用 **临时 Git index + 隔离 staging directory**，不要使用真实 index，
+也不要在 begin 时创建额外长期 worktree。
+
+`begin_change_set()` 在 workspace 写锁中：
+
+1. 拒绝 merge、rebase、cherry-pick、bisect 等未完成 Git 操作。
+2. 检查真实 worktree 中没有 submodule、symlink 或超出配置上限的待复制内容。
+3. 创建临时 index，并设置 `GIT_INDEX_FILE` 指向 Change Set 目录。
+4. `git read-tree HEAD`，再用临时 index 对当前 worktree 执行 `git add -A -- .`。
+   这会捕获当前 tracked 和非 ignored untracked 文件，但不能修改真实 index。
+5. `git write-tree` 得到 `before_tree_hash`。它代表 begin 时的 **worktree 内容**，
+   而不是仅代表 `HEAD`。
+6. 从该 tree materialize `staging/`，然后删除临时 index。
+7. 保存 `base_head`、before tree hash、文件数量、总字节数和初始 manifest。
+
+需要在实现和测试中显式传递 `GIT_INDEX_FILE`、`GIT_WORK_TREE` 和必要的 Git 环境变量，
+绝不能依赖进程级环境变量修改。真实 index 在 begin、stage、validate、commit 前后
+必须 byte-for-byte 不变。
+
+配置增加：
+
+```yaml
+change_sets:
+  enabled: true
+  ttl_hours: 24
+  max_active_per_workspace: 1
+  max_operations: 100
+  max_changed_files: 500
+  max_staging_bytes: 268435456
+  max_patch_chars: 10000000
+  retain_terminal_hours: 24
+  auto_rollback_on_validation_failure: false
+```
+
+达到文件数、patch 大小或 staging 字节上限时返回 `CHANGE_SET_LIMIT_EXCEEDED`，
+不能在磁盘写满后才失败。
+
+### 6.5 Stage 操作契约
+
+`stage_patch()`：
+
+```text
+stage_patch(
+    change_set_id,
+    patch,
+    explanation,
+    expected_sha256=null,
+    operation_id=null,
+    idempotency_key
+)
+```
+
+* 复用 `patcher.py` 的 wrapper stripping、unified diff parser、path extraction、
+  deny-path 和 error classification；应将这些提取到共享 service，避免复制实现。
+* `git apply --check` 和 `git apply` 的 cwd/Git work tree 指向 `staging/`。
+* `expected_sha256` 比较的是该操作执行前 staging tree 中的内容，因此可以安全引用
+  前一个 stage 操作的输出。
+* 一个 patch 中路径重复、大小越界或触及不支持文件类型时整次 stage 失败，staging
+  tree 保持该操作前状态。
+
+`stage_replace()`：
+
+```text
+stage_replace(
+    change_set_id,
+    path,
+    old_text,
+    new_text,
+    explanation,
+    expected_sha256=null,
+    replace_all=false,
+    operation_id=null,
+    idempotency_key
+)
+```
+
+* 语义与现有 `replace_text` 一致，但目标是 staging tree。
+* 写入仍采用 sibling temp file + `os.replace()`。
+* 第一版只支持 regular UTF-8 text file。
+
+两类 stage 的共同规则：
+
+* Change Set 必须属于 active workspace，且状态只能是 `open` 或 `validated`。
+* 同一个 Change Set 的 stage 操作用 `change_set:<id>` 独占锁串行。
+* `operation_id` 在 Change Set 内唯一；相同 ID 和相同 input hash 返回原结果，
+  相同 ID 但不同输入返回 `IDEMPOTENCY_CONFLICT`。
+* ordinal 由数据库事务分配，不能使用事务外 `MAX(ordinal) + 1`。
+* stage 开始前保存受影响文件的 staging checkpoint；操作失败时恢复 checkpoint。
+* 成功后重新计算 changed-file manifest、`staged_digest` 和 Change Set revision。
+* 返回 operation ordinal、changed files、每个文件的 before/current SHA、diff stat，
+  以及是否使旧 validation 失效。
+* explanation、expected hashes 和 idempotency key 必须纳入 middleware fingerprint；
+  不可重复现有 `apply_patch` 漏掉 `expected_sha256` 的问题。
+
+增加只读 `get_change_set()`，返回状态、revision、操作摘要、文件 manifest、
+validation 摘要和 truncated diff preview。源码内容和完整 operation payload 不返回。
+
+### 6.6 Validate 语义
+
+```text
+validate_change_set(
+    change_set_id,
+    expected_revision,
+    validation_profile="default"
+)
+```
+
+第一版 validation 分三层：
+
+1. **结构验证**：所有 operation payload/hash 可读取，staging manifest 与数据库一致，
+   路径仍在 workspace 内，未出现 deny path、不支持类型或资源超限。
+2. **Git 验证**：从 before tree 到 staging tree 生成一个 final patch，并在干净的
+   before snapshot 上执行整包 `git apply --check`。
+3. **配置化 validator**：仅运行明确标记为 `change_set_safe` 的 formatter/check；
+   cwd 必须是 staging tree，环境按普通 process policy 脱敏并受 timeout/output/resource
+   限制。
+
+formatter 必须在 staging tree 中运行。formatter 产生的附加修改要纳入 changed-file
+manifest、after tree hash 和 final patch，然后才算 validation 成功。只对 changed files
+运行的工具从 manifest 获取路径，不接受 agent 自行拼接未验证路径。
+
+第一版若不准备同时实现安全的 staging process runner，可以先只交付第 1、2 层，
+并把配置化 formatter/check 明确放到后续提交；不能让 `run_check` 暂时指向真实
+workspace 来冒充 Change Set validation。
+
+验证成功后保存：
+
+```text
+validated_digest = SHA256(
+    change_set_id
+    + revision
+    + before_tree_hash
+    + after_tree_hash
+    + ordered operation input hashes
+    + validation profile/version
+)
+```
+
+返回：
+
+* before/after tree hash；
+* validated digest 和 Change Set revision；
+* added/modified/deleted/renamed 文件；
+* 每个 validator 的结构化结果；
+* diff stat 和受大小限制的 diff preview；
+* warnings，例如真实 workspace 自 begin 后已发生变化。
+
+validator 失败时默认保持 `open`，staging 内容仍可检查和继续修改。
+`auto_rollback_on_validation_failure=true` 只关闭并清理 Change Set，不应回滚真实
+workspace，因为 stage 从未修改它。
+
+### 6.7 Commit 算法和回滚
+
+```text
+commit_change_set(
+    change_set_id,
+    validated_digest,
+    expected_workspace_tree=before_tree_hash,
+    idempotency_key
+)
+```
+
+commit 必须使用 workspace concurrency key，而不是只使用 change-set key。执行顺序：
+
+1. 获取 workspace 独占写锁，并在锁内再次读取 Change Set。
+2. 校验状态为 `validated`，revision、`validated_digest` 和 after tree hash 全部匹配。
+3. 用与 begin 完全相同的临时-index算法计算真实 workspace 当前 tree hash。
+4. 当前 hash 不等于 `before_tree_hash` 时返回 `CHANGE_SET_CONFLICT`；此时不创建
+   rollback snapshot，也不改文件。第一版采用 whole-tree conflict，虽然保守，但不会
+   错过 unrelated path、rename 或 untracked file 的竞争修改。以后才优化成 touched-path
+   conflict。
+5. 将 touched paths 的 before 内容、存在性和 mode 保存到 `rollback/`，fsync manifest，
+   journal 写入 `commit_intent`。
+6. 对 final patch 再执行一次 `git apply --check`，journal 写入 `applying`。
+7. 应用 final patch。不要调用公开 `apply_patch`，而应调用共享的低层 patch engine，
+   避免嵌套 middleware、第二份 audit 和第二次 idempotency。
+8. 重新计算 workspace tree hash。只有等于 `after_tree_hash` 才写 journal
+   `files_applied`。
+9. 在一个 SQLite transaction 中将 Change Set 标记为 `committed`、记录
+   before/after hash、更新 workspace revision/metadata、完成 operation audit，并插入
+   `change_set.committed` 事件。
+10. journal 写入 `complete`；rollback snapshot 延迟到 retention cleanup 删除。
+
+任何文件应用或 after-hash 验证失败时：
+
+1. 按 manifest 恢复原有文件和 mode；
+2. 删除本次新建文件；
+3. 再计算 workspace tree hash；
+4. 等于 before tree 时标记 `rolled_back`，返回原始错误并附
+   `rollback_performed=true`；
+5. 不能恢复或不能证明 hash 相等时标记 `recovery_required`，返回
+   `CHANGE_SET_RECOVERY_REQUIRED`，保留 staging、rollback 和 journal。
+
+恢复文件也必须使用 workspace 内 sibling temp + `os.replace()`，并通过
+`resolve_within()` 再验证 manifest path。不得对未验证路径执行递归删除。
+
+真实 Git index不参与 final patch 应用。用户原有 staged/unstaged 区分应保持；
+Change Set 只改变 worktree 文件。验收测试必须覆盖“真实 index 已有 staged change”
+的场景。
+
+### 6.8 Rollback、过期和服务恢复
+
+`rollback_change_set()` 的含义是放弃尚未 commit 的 staging 内容：
+
+* `open`/`validated`：标记 `rolled_back` 并清理 staging；真实 workspace 无需修改。
+* `rolled_back`：幂等返回成功。
+* `committed`：返回 `CHANGE_SET_ALREADY_COMMITTED`，不能把它解释为
+  “反向修改 workspace”。如需 undo，应创建新的 Change Set。
+* `committing`/`recovery_required`：普通 rollback 请求不能盲目删除数据，必须先走
+  recovery reconciliation。
+
+server 启动时扫描 `committing`：
+
+```text
+workspace hash == after_tree_hash
+  → 完成数据库收尾，标记 committed
+
+workspace hash == before_tree_hash
+  → 标记 rolled_back
+
+journal 表明 applying/files_applied 且 rollback snapshot 完整
+  → 尝试恢复 before，验证成功后标记 rolled_back
+
+其他情况
+  → 标记 recovery_required，保留所有证据并阻止 workspace 写入
+```
+
+禁止恢复逻辑再次执行 final patch，因为 crash 可能发生在 patch 已经应用但 DB 尚未
+commit 的窗口。恢复只能通过 hash 判断或向 before 状态回滚。
+
+retention job：
+
+* `open`/`validated` 到期后标记 `expired` 并删除 staging；
+* `committed`/`rolled_back` 的磁盘数据超过 retention 后分批清理；
+* `committing`/`recovery_required` 永不自动删除；
+* discard workspace 前先拒绝或安全关闭非终态 Change Set；
+* DB row 可以长期保留摘要，但 payload、snapshot 和完整 diff 按配置清理。
+
+### 6.9 ToolSpec、事件、capabilities 和错误码
+
+加入 ToolSpec：
+
+```text
+begin_change_set       workspace write key, WRITE + GIT
+stage_patch            change-set write key, WRITE + GIT
+stage_replace          change-set write key, WRITE
+validate_change_set    change-set write key, READ + EXECUTE（若运行 validator）
+commit_change_set      workspace write key, WRITE + GIT, idempotency required
+rollback_change_set    change-set write key, WRITE
+get_change_set         change-set read key, READ
+```
+
+由于只传 `change_set_id` 的工具无法从输入直接得到 workspace，middleware 需要在
+调度前安全解析 Change Set scope，或允许 concurrency-key resolver 查询 DB。不能因为
+缺少 `workspace_id` 而跳过 workspace ownership、permission 和 audit 关联。
+
+事件增加：
+
+```text
+change_set.begun
+change_set.staged
+change_set.validated
+change_set.validation_failed
+change_set.committed
+change_set.rolled_back
+change_set.recovery_required
+```
+
+事件 payload 只放 change_set ID、revision、operation type、file count、hash、
+validation status 和 error code，不放 patch、old/new text、diff 或文件内容。
+
+`get_capabilities()` 增加：
+
+```json
+{
+  "supports_change_sets": true,
+  "change_set_limits": {
+    "max_operations": 100,
+    "max_changed_files": 500,
+    "max_staging_bytes": 268435456,
+    "ttl_hours": 24
+  },
+  "change_set_file_types": ["utf8_regular_file"],
+  "supports_change_set_validators": false
+}
+```
+
+稳定错误码至少包括：
+
+```text
+CHANGE_SET_NOT_FOUND
+CHANGE_SET_ALREADY_ACTIVE
+CHANGE_SET_INVALID_STATE
+CHANGE_SET_NOT_VALIDATED
+CHANGE_SET_CONFLICT
+CHANGE_SET_LIMIT_EXCEEDED
+CHANGE_SET_EXPIRED
+CHANGE_SET_ALREADY_COMMITTED
+CHANGE_SET_VALIDATION_FAILED
+CHANGE_SET_RECOVERY_REQUIRED
+```
+
+### 6.10 实施顺序
+
+建议拆成以下可独立 review 的提交：
+
+1. **共享 edit engine**：从 `patcher.py` 提取 parser、path validation、patch apply 和
+   exact replacement primitives；保证现有 `apply_patch`/`replace_text` 行为不变。
+2. **Schema + ChangeSetStore**：状态机、revision、operation ordinal、partial unique
+   index、配置和磁盘目录安全。
+3. **Snapshot + staging**：临时 index、before tree materialization、`stage_patch`、
+   `stage_replace` 和资源上限。
+4. **Validation**：manifest、final patch、before/after tree hash、validated digest；
+   第一版可只实现结构和 Git 验证。
+5. **Commit + recovery**：workspace conflict check、rollback manifest、journal、
+   after-hash verification 和启动 reconciliation。
+6. **MCP 集成**：tools、ToolSpec scope resolution、idempotency、events、capabilities、
+   audit 和稳定错误码。
+7. **可选 validator/formatter**：staging process runner、changed-file selection 和
+   结构化结果。此步不阻塞 Change Set MVP。
+8. **后续代码智能**：AST-aware rename/import edit 作为独立阶段，不与文件事务核心
+   混在第一版。
+
+第一版完成 1–6 即可验收。
+
+### 6.11 测试要求
+
+单元测试：
+
+* 状态迁移合法性和非法状态错误；
+* 同一 workspace 只能创建一个非终态 Change Set；
+* operation ordinal 并发分配不重复；
+* 相同 operation/idempotency key 安全 replay，不同输入冲突；
+* stage patch/replace 顺序可见，失败的单个 stage 不污染 staging tree；
+* stage 后旧 validation 自动失效；
+* deny path、路径穿越、absolute path、symlink、binary、submodule 和 ignored path；
+* max operations、files、patch chars 和 staging bytes；
+* validated digest 对 operation 顺序、tree hash、revision 和 profile 敏感；
+* rollback 对 open/validated/rolled_back/committed 的确定语义；
+* operation/event/audit 不包含源码正文或绝对路径。
+
+集成测试：
+
+* begin 和所有 stage 操作都不改变真实 workspace 或真实 Git index；
+* workspace 原本 dirty 时，before tree 正确代表当前 worktree 而不是 HEAD；
+* patch + replace + create + delete 可以作为一个 Change Set commit；
+* commit 前任意 workspace 文件变化都会得到 `CHANGE_SET_CONFLICT` 且零写入；
+* final patch 第二次 check 失败时零写入；
+* 模拟第 N 个文件替换失败后，所有已修改文件恢复到 before tree；
+* rollback restore 本身失败时进入 `recovery_required`，证据目录仍存在；
+* crash 注入覆盖 `commit_intent`、`applying`、`files_applied`、DB commit 前后；
+* restart reconciliation 不重复应用 Change Set；
+* commit idempotency retry 返回同一个 after tree 和结果；
+* 真实 Git index 中已有 staged changes 时，commit 后 index 内容不变；
+* 两个并发 commit/普通 `apply_patch` 由 workspace lock 串行，loser 明确 conflict；
+* workspace discard、Change Set expiration 和 retention cleanup 不误删
+  `recovery_required` 数据；
+* Windows 长路径、只读文件、大小写碰撞和文件占用错误有确定结果；
+* 现有 patcher、reader、workspace、event、audit 和 report 测试继续通过。
+
+属性/故障注入测试：
+
+* 随机生成一组 create/modify/delete 操作，成功时 workspace hash 等于 after tree；
+* 在每个 filesystem step 注入异常，失败后 hash 只能是 before tree 或状态必须为
+  `recovery_required`；
+* 任意重试次数都不能产生第二次 commit 或不同 operation ordinal；
+* manifest 中任意恶意路径都无法使 restore 写到 workspace 外。
+
+### 6.12 验收标准
+
+* [ ] stage 操作对真实 workspace 和真实 Git index 零修改。
+* [ ] 同一 Change Set 中 patch/replace 按顺序组合，并产生稳定 preview 和 manifest。
+* [ ] 未 validate、digest 过期或 workspace 已变化的 Change Set 不能 commit。
+* [ ] commit 成功后 workspace tree hash 精确等于 validation 的 after tree hash。
+* [ ] 任意可恢复的 commit 失败都会回到 before tree，不留下半完成修改。
+* [ ] crash 后能够确定 committed/rolled_back；不能确定时明确进入
+  `recovery_required`，绝不静默重放。
+* [ ] 真实 Git index、branch 和 HEAD 不被 Change Set 修改。
+* [ ] workspace 外路径、deny path 和不支持文件类型不能进入 staging 或 rollback。
+* [ ] commit 和 rollback 可幂等重试，operation ordinal 和最终事件不重复。
+* [ ] patch、源码、old/new text 和未脱敏绝对路径不进入 audit/event payload。
+* [ ] staging 大小、操作数、文件数、TTL 和 retention 均受配置限制。
+* [ ] 普通写工具在 commit 期间不能观察或制造中间状态。
+* [ ] 原有 `apply_patch` 和 `replace_text` 保持兼容且全部测试通过。
 
 `apply_patch` 继续作为通用 fallback，不必删除。
 

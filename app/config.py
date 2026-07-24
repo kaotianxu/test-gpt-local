@@ -86,6 +86,18 @@ def load_operator_config(path: Path | None = None) -> dict[str, Any]:
     events.setdefault("max_waiters", 32)
     events.setdefault("output_coalesce_ms", 100)
 
+    # --- atomic change sets ---
+    change_sets = cfg.setdefault("change_sets", {})
+    change_sets.setdefault("enabled", True)
+    change_sets.setdefault("ttl_hours", 24)
+    change_sets.setdefault("max_active_per_workspace", 1)
+    change_sets.setdefault("max_operations", 100)
+    change_sets.setdefault("max_changed_files", 500)
+    change_sets.setdefault("max_staging_bytes", 268_435_456)
+    change_sets.setdefault("max_patch_chars", 10_000_000)
+    change_sets.setdefault("retain_terminal_hours", 24)
+    change_sets.setdefault("auto_rollback_on_validation_failure", False)
+
     # --- logging defaults ---
     log = cfg.setdefault("logging", {})
     log.setdefault("level", "INFO")
@@ -174,6 +186,19 @@ def _validate_operator_config(cfg: dict[str, Any]) -> None:
             raise ValueError(f"events.{key} is below its minimum")
     if float(events["max_wait_seconds"]) <= 0:
         raise ValueError("events.max_wait_seconds must be positive")
+
+    change_sets = cfg["change_sets"]
+    for key in (
+        "ttl_hours",
+        "max_active_per_workspace",
+        "max_operations",
+        "max_changed_files",
+        "max_staging_bytes",
+        "max_patch_chars",
+        "retain_terminal_hours",
+    ):
+        if int(change_sets[key]) < 1:
+            raise ValueError(f"change_sets.{key} must be positive")
 
     service = cfg["service"]
     for key in (
@@ -282,3 +307,8 @@ def get_image_config() -> dict[str, Any]:
 def get_artifact_config() -> dict[str, Any]:
     """Return artifact discovery and cleanup settings."""
     return cast(dict[str, Any], load_operator_config()["artifacts"])
+
+
+def get_change_set_config() -> dict[str, Any]:
+    """Return atomic change-set limits and retention settings."""
+    return cast(dict[str, Any], load_operator_config()["change_sets"])

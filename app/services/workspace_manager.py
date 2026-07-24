@@ -334,6 +334,16 @@ def discard_workspace(workspace_id: str) -> dict[str, Any]:
     record = db.get_workspace(workspace_id)
     if record is None:
         raise ValueError(f"workspace not found: {workspace_id!r}")
+    from app.services.change_set_store import (
+        ChangeSetError,
+        assert_workspace_discardable,
+        delete_terminal_data,
+    )
+
+    try:
+        assert_workspace_discardable(workspace_id)
+    except ChangeSetError as exc:
+        raise ValueError(str(exc)) from exc
 
     worktree_path = Path(record["worktree_path"])
     project = get_project(record["project_id"])
@@ -397,6 +407,7 @@ def discard_workspace(workspace_id: str) -> dict[str, Any]:
     database_record_removed = False
     if not path_exists_after and git_registration_removed:
         ProcessManager.get_instance().delete_outputs_for_workspace(workspace_id)
+        delete_terminal_data(workspace_id)
         db.delete_workspace(workspace_id)
         database_record_removed = db.get_workspace(workspace_id) is None
     elif git_error is None:

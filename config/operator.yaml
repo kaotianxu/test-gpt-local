@@ -64,6 +64,17 @@ events:
   max_waiters: 32
   output_coalesce_ms: 100
 
+change_sets:
+  enabled: true
+  ttl_hours: 24
+  max_active_per_workspace: 1
+  max_operations: 100
+  max_changed_files: 500
+  max_staging_bytes: 268435456
+  max_patch_chars: 10000000
+  retain_terminal_hours: 24
+  auto_rollback_on_validation_failure: false
+
 logging:
   level: INFO
   retention_days: 14

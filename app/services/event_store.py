@@ -25,6 +25,13 @@ EVENT_TYPES = frozenset(
         "process.exited",
         "artifact.created",
         "check.completed",
+        "change_set.begun",
+        "change_set.staged",
+        "change_set.validated",
+        "change_set.validation_failed",
+        "change_set.committed",
+        "change_set.rolled_back",
+        "change_set.recovery_required",
     }
 )
 TERMINAL_PROCESS_STATUSES = frozenset(
