@@ -13,9 +13,11 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import tarfile
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -182,16 +184,26 @@ def _tree_from_directory(repository: Path, source: Path, base_tree: str, owner: 
 
 
 def _materialize(repository: Path, tree: str, destination: Path) -> None:
+    archive = _run_git(repository, ["archive", "--format=tar", tree]).stdout
     destination.mkdir(parents=True, exist_ok=False)
-    for path, (mode, object_id) in _tree_entries(repository, tree).items():
-        relative = PurePosixPath(path)
-        if relative.is_absolute() or ".." in relative.parts:
-            raise ChangeSetError("CHANGE_SET_VALIDATION_FAILED", "unsafe Git tree entry")
-        target = resolve_within(destination, path, must_exist=False)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(_run_git(repository, ["cat-file", "blob", object_id]).stdout)
-        if mode == "100755":
-            os.chmod(target, target.stat().st_mode | 0o111)
+    with tarfile.open(fileobj=BytesIO(archive), mode="r:") as bundle:
+        regular_members: list[tarfile.TarInfo] = []
+        for member in bundle.getmembers():
+            relative = PurePosixPath(member.name)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ChangeSetError("CHANGE_SET_VALIDATION_FAILED", "unsafe Git tree entry")
+            if member.isfile() or member.isdir():
+                regular_members.append(member)
+            elif member.issym() or member.islnk():
+                # Symlink entries remain immutable in the temporary Git index;
+                # never materialize a link that could resolve outside staging.
+                continue
+            else:
+                raise ChangeSetError(
+                    "CHANGE_SET_VALIDATION_FAILED",
+                    "unsupported Git archive entry",
+                )
+        bundle.extractall(destination, members=regular_members, filter="data")
 
 
 def _write_json(path: Path, value: Any) -> None:
